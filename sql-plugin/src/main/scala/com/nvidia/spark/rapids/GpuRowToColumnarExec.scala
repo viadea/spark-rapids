@@ -58,7 +58,7 @@ private class GpuRowToColumnConverter(schema: StructType) extends Serializable w
    */
   final def convertBatch(rows: Array[InternalRow], schema: StructType): ColumnarBatch = {
     val numRows = rows.length
-    val builders = new GpuColumnarBatchBuilder(schema, numRows)
+    val builders = new GpuColumnarBatchBuilder(schema, numRows, null)
     rows.foreach(convert(_, builders))
     builders.build(numRows)
   }
@@ -526,23 +526,13 @@ private object GpuRowToColumnConverter {
       row: SpecializedGetters,
       column: Int,
       builder: ai.rapids.cudf.HostColumnVector.ColumnBuilder): Double = {
-      builder.append(row.getDecimal(column, precision, scale).toJavaBigDecimal)
-      // We are basing our DType.DECIMAL on precision in GpuColumnVector#toRapidsOrNull so we can
-      // safely assume the underlying vector is Int if precision < 10 otherwise Long
-      if (precision <= Decimal.MAX_INT_DIGITS) {
-        4
-      } else {
-        8
-      }
+      // Because DECIMAL64 is the only supported decimal DType, we can
+      // append unscaledLongValue instead of BigDecimal itself to speedup this conversion.
+      builder.append(row.getDecimal(column, precision, scale).toUnscaledLong)
+      8
     }
 
-    override def getNullSize: Double = {
-      if (precision <= Decimal.MAX_INT_DIGITS) {
-        4
-      } else {
-        8
-      } + VALIDITY
-    }
+    override def getNullSize: Double = 8 + VALIDITY
   }
 }
 
@@ -585,7 +575,7 @@ class RowToColumnarIterator(
       }
     }
 
-    val builders = new GpuColumnarBatchBuilder(localSchema, targetRows)
+    val builders = new GpuColumnarBatchBuilder(localSchema, targetRows, null)
     try {
       var rowCount = 0
       // Double because validity can be < 1 byte, and this is just an estimate anyways
@@ -663,7 +653,8 @@ object GeneratedUnsafeRowToCudfRowIterator extends Logging {
       val attr = pair._1
       val colIndex = pair._2
       // This only works on fixed width types
-      val length = DecimalUtil.getDataTypeSize(attr.dataType)
+      // TODO once we support DECIMAL32 we will need a special case in here for it.
+      val length = attr.dataType.defaultSize
       cudfOffset = CudfUnsafeRow.alignOffset(cudfOffset, length)
       val ret = length match {
         case 1 => s"Platform.putByte(null, startAddress + $cudfOffset, Platform.getByte($rowBaseObj, $rowBaseOffset + ${sparkValidityOffset + (colIndex * 8)}));"
@@ -825,7 +816,7 @@ case class GpuRowToColumnarExec(child: SparkPlan, goal: CoalesceGoal)
     // The cudf kernel only supports up to 1.5 KB per row which means at most 184 double/long
     // values. Spark by default limits codegen to 100 fields "spark.sql.codegen.maxFields".
     // So, we are going to be cautious and start with that until we have tested it more.
-    if ((1 until 100).contains(output.length) &&
+    if (output.length > 0 && output.length < 100 &&
         CudfRowTransitions.areAllSupported(output)) {
       val localOutput = output
       rowBased.mapPartitions(rowIter => GeneratedUnsafeRowToCudfRowIterator(

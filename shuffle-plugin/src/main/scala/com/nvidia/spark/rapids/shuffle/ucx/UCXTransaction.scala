@@ -322,6 +322,7 @@ private[ucx] class UCXTransaction(conn: UCXConnection, val txId: Long)
             if (!msg.isCompleted) {
               hadError = true
             }
+            msg.close()
           }
         } catch {
           case t: Throwable =>

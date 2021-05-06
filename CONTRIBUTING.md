@@ -43,7 +43,9 @@ After a successful build the RAPIDS Accelerator jar will be in the `dist/target/
 ### Building against different CUDA Toolkit versions
 
 You can build against different versions of the CUDA Toolkit by using one of the following profiles:
-* `-Pcuda11` (CUDA 11.0/11.1/11.2, default)
+* `-Pcuda10-1` (CUDA 10.1, default)
+* `-Pcuda10-2` (CUDA 10.2)
+* `-Pcuda11` (CUDA 11.0)
 
 ## Code contributions
 

@@ -67,6 +67,7 @@ object HostColumnarToGpu extends Logging {
   def arrowColumnarCopy(
       cv: ColumnVector,
       ab: ai.rapids.cudf.ArrowColumnBuilder,
+      nullable: Boolean,
       rows: Int): ju.List[ReferenceManager] = {
     val valVector = cv match {
       case v: ArrowColumnVector =>
@@ -99,7 +100,7 @@ object HostColumnarToGpu extends Logging {
     try {
       offsets = getBufferAndAddReference(ShimLoader.getSparkShims.getArrowOffsetsBuf(valVector))
     } catch {
-      case _: UnsupportedOperationException =>
+      case e: UnsupportedOperationException =>
         // swallow the exception and assume no offsets buffer
     }
     ab.addBatch(rows, nullCount, dataBuf, validity, offsets)
@@ -210,28 +211,22 @@ object HostColumnarToGpu extends Logging {
           b.appendNull()
         }
       case (dt: DecimalType, nullable) =>
+        // Because DECIMAL64 is the only supported decimal DType, we can
+        // append unscaledLongValue instead of BigDecimal itself to speedup this conversion.
+        // If we know that the value is WritableColumnVector we could
+        // speed this up even more by getting the unscaled long or int directly.
         if (nullable) {
           for (i <- 0 until rows) {
             if (cv.isNullAt(i)) {
               b.appendNull()
             } else {
               // The precision here matters for cpu column vectors (such as OnHeapColumnVector).
-              if (DecimalType.is32BitDecimalType(dt)) {
-                b.append(cv.getDecimal(i, dt.precision, dt.scale).toUnscaledLong.toInt)
-              } else {
-                b.append(cv.getDecimal(i, dt.precision, dt.scale).toUnscaledLong)
-              }
+              b.append(cv.getDecimal(i, dt.precision, dt.scale).toUnscaledLong)
             }
           }
         } else {
-          if (DecimalType.is32BitDecimalType(dt)) {
-            for (i <- 0 until rows) {
-              b.append(cv.getDecimal(i, dt.precision, dt.scale).toUnscaledLong.toInt)
-            }
-          } else {
-            for (i <- 0 until rows) {
-              b.append(cv.getDecimal(i, dt.precision, dt.scale).toUnscaledLong)
-            }
+          for (i <- 0 until rows) {
+            b.append(cv.getDecimal(i, dt.precision, dt.scale).toUnscaledLong)
           }
         }
       case (t, _) =>
@@ -314,10 +309,10 @@ class HostToGpuCoalesceIterator(iter: Iterator[ColumnarBatch],
       (batch.column(0).isInstanceOf[ArrowColumnVector] ||
         batch.column(0).isInstanceOf[AccessibleArrowColumnVector])) {
       logDebug("Using GpuArrowColumnarBatchBuilder")
-      batchBuilder = new GpuColumnVector.GpuArrowColumnarBatchBuilder(schema)
+      batchBuilder = new GpuColumnVector.GpuArrowColumnarBatchBuilder(schema, batchRowLimit, batch)
     } else {
       logDebug("Using GpuColumnarBatchBuilder")
-      batchBuilder = new GpuColumnVector.GpuColumnarBatchBuilder(schema, batchRowLimit)
+      batchBuilder = new GpuColumnVector.GpuColumnarBatchBuilder(schema, batchRowLimit, null)
     }
     totalRows = 0
   }

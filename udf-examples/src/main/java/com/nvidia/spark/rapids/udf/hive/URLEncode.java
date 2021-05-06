@@ -77,7 +77,7 @@ public class URLEncode extends GenericUDF implements RapidsUDF {
     if (text == null) {
       return null;
     }
-    String encoded;
+    String encoded = null;
     try {
       encoded = URLEncoder.encode(text.toString(), "utf-8")
           .replace("+", "%20")

@@ -125,7 +125,9 @@ class ArrowColumnarDataSourceV2 extends TestingV2Source {
         ArrowInputPartition(TestingV2Source.dataTypesToUse, 100, 101))
     }
 
-    override def createReaderFactory(): PartitionReaderFactory = ColumnarReaderFactory
+    override def createReaderFactory(): PartitionReaderFactory = {
+      new ColumnarReaderFactory(options)
+    }
   }
 
   override def getTable(options: CaseInsensitiveStringMap): Table = new SimpleBatchTable {
@@ -135,7 +137,8 @@ class ArrowColumnarDataSourceV2 extends TestingV2Source {
   }
 }
 
-object ColumnarReaderFactory extends PartitionReaderFactory {
+class ColumnarReaderFactory(options: CaseInsensitiveStringMap)
+    extends PartitionReaderFactory {
   private final val BATCH_SIZE = 20
 
   override def supportColumnarReads(partition: InputPartition): Boolean = true

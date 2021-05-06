@@ -16,8 +16,6 @@
 
 package com.nvidia.spark.rapids
 
-import ai.rapids.cudf.{ContiguousTable, DeviceMemoryBuffer}
-
 import org.apache.spark.TaskContext
 import org.apache.spark.sql.rapids.TempSpillBufferId
 import org.apache.spark.sql.types.DataType
@@ -152,25 +150,6 @@ object SpillableColumnarBatch extends Arm {
     }
   }
 
-  /**
-   * Create a new SpillableColumnarBatch
-   * @note The caller is responsible for closing the contiguous table parameter.
-   * @param ct contiguous table containing the batch GPU data
-   * @param sparkTypes array of Spark types describing the data schema
-   * @param priority the initial spill priority of this batch
-   * @param spillCallback a callback when the buffer is spilled. This should be very light weight.
-   *                      It should never allocate GPU memory and really just be used for metrics.
-   */
-  def apply(
-      ct: ContiguousTable,
-      sparkTypes: Array[DataType],
-      priority: Long,
-      spillCallback: RapidsBuffer.SpillCallback): SpillableColumnarBatch = {
-    val id = TempSpillBufferId()
-    RapidsBufferCatalog.addContiguousTable(id, ct, priority, spillCallback)
-    new SpillableColumnarBatchImpl(id, ct.getRowCount.toInt, sparkTypes)
-  }
-
   private[this] def addBatch(
       id: RapidsBufferId,
       batch: ColumnarBatch,
@@ -207,74 +186,5 @@ object SpillableColumnarBatch extends Arm {
         }
       }
     }
-  }
-}
-
-
-/**
- * Just like a SpillableColumnarBatch but for buffers.
- */
-class SpillableBuffer (id: TempSpillBufferId) extends AutoCloseable with Arm {
-  private var closed = false
-
-  /**
-   * The ID that this is stored under.
-   * @note Use with caution because if this has been closed the id is no longer valid.
-   */
-  def spillId: TempSpillBufferId = id
-
-  lazy val sizeInBytes: Long =
-    withResource(RapidsBufferCatalog.acquireBuffer(id)) { buff =>
-      buff.size
-    }
-
-  /**
-   * Set a new spill priority.
-   */
-  def setSpillPriority(priority: Long): Unit = {
-    withResource(RapidsBufferCatalog.acquireBuffer(id)) { rapidsBuffer =>
-      rapidsBuffer.setSpillPriority(priority)
-    }
-  }
-
-  /**
-   * Get the device buffer.
-   * @note It is the responsibility of the caller to close the buffer.
-   */
-  def getDeviceBuffer(): DeviceMemoryBuffer = {
-    withResource(RapidsBufferCatalog.acquireBuffer(id)) { rapidsBuffer =>
-      GpuSemaphore.acquireIfNecessary(TaskContext.get())
-      rapidsBuffer.getDeviceMemoryBuffer
-    }
-  }
-
-  /**
-   * Remove the buffer from the cache.
-   */
-  override def close(): Unit = {
-    if (!closed) {
-      RapidsBufferCatalog.removeBuffer(id)
-      closed = true
-    }
-  }
-}
-
-object SpillableBuffer extends Arm {
-
-  /**
-   * Create a new SpillableBuffer.
-   * @note This takes over ownership of buffer, and buffer should not be used after this.
-   * @param buffer the buffer to make spillable
-   * @param priority the initial spill priority of this buffer
-   * @param spillCallback a callback when the buffer is spilled. This should be very light weight.
-   *                      It should never allocate GPU memory and really just be used for metrics.
-   */
-  def apply(buffer: DeviceMemoryBuffer,
-      priority: Long,
-      spillCallback: RapidsBuffer.SpillCallback): SpillableBuffer = {
-    val id = TempSpillBufferId()
-    val meta = MetaUtils.getTableMetaNoTable(buffer)
-    RapidsBufferCatalog.addBuffer(id, buffer, meta, priority, spillCallback)
-    new SpillableBuffer(id)
   }
 }

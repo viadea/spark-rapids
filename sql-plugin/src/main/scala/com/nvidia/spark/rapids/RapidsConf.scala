@@ -76,9 +76,9 @@ object ConfHelper {
     v.map(stringConverter).mkString(",")
   }
 
-  def byteFromString(str: String, unit: ByteUnit): Long = {
+  def byteFromString(str: String, unit: ByteUnit, key: String): Long = {
     val (input, multiplier) =
-      if (str.nonEmpty && str.head == '-') {
+      if (str.length() > 0 && str.charAt(0) == '-') {
         (str.substring(1), -1)
       } else {
         (str, 1)
@@ -265,7 +265,7 @@ class ConfBuilder(val key: String, val register: ConfEntry[_] => Unit) {
   }
 
   def bytesConf(unit: ByteUnit): TypedConfBuilder[Long] = {
-    new TypedConfBuilder[Long](this, byteFromString(_, unit))
+    new TypedConfBuilder[Long](this, byteFromString(_, unit, key))
   }
 
   def integerConf: TypedConfBuilder[Integer] = {
@@ -494,13 +494,9 @@ object RapidsConf {
     .createWithDefault(false)
 
   val INCOMPATIBLE_DATE_FORMATS = conf("spark.rapids.sql.incompatibleDateFormats.enabled")
-    .doc("When parsing strings as dates and timestamps in functions like unix_timestamp, some " +
-         "formats are fully supported on the GPU and some are unsupported and will fall back to " + 
-         "the CPU.  Some formats behave differently on the GPU than the CPU.  Spark on the CPU " +
-         "interprets date formats with unsupported trailing characters as nulls, while Spark on " +
-         "the GPU will parse the date with invalid trailing characters. More detail can be found " +
-         "at [parsing strings as dates or timestamps]" + 
-         "(compatibility.md#parsing-strings-as-dates-or-timestamps).")
+      .doc("When parsing strings as dates and timestamps in functions like unix_timestamp, " +
+          "setting this to true will force all parsing onto GPU even for formats that can " +
+          "result in incorrect results when parsing invalid inputs.")
       .booleanConf
       .createWithDefault(false)
 
@@ -611,50 +607,16 @@ object RapidsConf {
       .booleanConf
       .createWithDefault(false)
 
-  val ENABLE_INNER_JOIN = conf("spark.rapids.sql.join.inner.enabled")
-      .doc("When set to true inner joins are enabled on the GPU")
-      .booleanConf
-      .createWithDefault(true)
-
-  val ENABLE_CROSS_JOIN = conf("spark.rapids.sql.join.cross.enabled")
-      .doc("When set to true cross joins are enabled on the GPU")
-      .booleanConf
-      .createWithDefault(true)
-
-  val ENABLE_LEFT_OUTER_JOIN = conf("spark.rapids.sql.join.leftOuter.enabled")
-      .doc("When set to true left outer joins are enabled on the GPU")
-      .booleanConf
-      .createWithDefault(true)
-
-  val ENABLE_RIGHT_OUTER_JOIN = conf("spark.rapids.sql.join.rightOuter.enabled")
-      .doc("When set to true right outer joins are enabled on the GPU")
-      .booleanConf
-      .createWithDefault(true)
-
-  val ENABLE_FULL_OUTER_JOIN = conf("spark.rapids.sql.join.fullOuter.enabled")
-      .doc("When set to true full outer joins are enabled on the GPU")
-      .booleanConf
-      .createWithDefault(true)
-
-  val ENABLE_LEFT_SEMI_JOIN = conf("spark.rapids.sql.join.leftSemi.enabled")
-      .doc("When set to true left semi joins are enabled on the GPU")
-      .booleanConf
-      .createWithDefault(true)
-
-  val ENABLE_LEFT_ANTI_JOIN = conf("spark.rapids.sql.join.leftAnti.enabled")
-      .doc("When set to true left anti joins are enabled on the GPU")
-      .booleanConf
-      .createWithDefault(true)
+  val ENABLE_CSV_TIMESTAMPS = conf("spark.rapids.sql.csvTimestamps.enabled")
+    .doc("When set to true, enables the CSV parser to read timestamps. The default output " +
+      "format for Spark includes a timezone at the end. Anything except the UTC timezone is not " +
+      "supported. Timestamps after 2038 and before 1902 are also not supported.")
+    .booleanConf
+    .createWithDefault(false)
 
   // FILE FORMATS
   val ENABLE_PARQUET = conf("spark.rapids.sql.format.parquet.enabled")
     .doc("When set to false disables all parquet input and output acceleration")
-    .booleanConf
-    .createWithDefault(true)
-
-  val ENABLE_PARQUET_INT96_WRITE = conf("spark.rapids.sql.format.parquet.writer.int96.enabled")
-    .doc("When set to false, disables accelerated parquet write if the " +
-      "spark.sql.parquet.outputTimestampType is set to INT96")
     .booleanConf
     .createWithDefault(true)
 
@@ -754,60 +716,6 @@ object RapidsConf {
     .booleanConf
     .createWithDefault(true)
 
-  // TODO should we change this config?
-  val ENABLE_CSV_TIMESTAMPS = conf("spark.rapids.sql.csvTimestamps.enabled")
-      .doc("When set to true, enables the CSV parser to read timestamps. The default output " +
-          "format for Spark includes a timezone at the end. Anything except the UTC timezone is " +
-          "not supported. Timestamps after 2038 and before 1902 are also not supported.")
-      .booleanConf
-      .createWithDefault(false)
-
-  val ENABLE_READ_CSV_DATES = conf("spark.rapids.sql.csv.read.date.enabled")
-      .doc("Parsing invalid CSV dates produces different results from Spark")
-      .booleanConf
-      .createWithDefault(false)
-
-  val ENABLE_READ_CSV_BOOLS = conf("spark.rapids.sql.csv.read.bool.enabled")
-      .doc("Parsing an invalid CSV boolean value produces true instead of null")
-      .booleanConf
-      .createWithDefault(false)
-
-  val ENABLE_READ_CSV_BYTES = conf("spark.rapids.sql.csv.read.byte.enabled")
-      .doc("Parsing CSV bytes is much more lenient and will return 0 for some " +
-          "malformed values instead of null")
-      .booleanConf
-      .createWithDefault(false)
-
-  val ENABLE_READ_CSV_SHORTS = conf("spark.rapids.sql.csv.read.short.enabled")
-      .doc("Parsing CSV shorts is much more lenient and will return 0 for some " +
-          "malformed values instead of null")
-      .booleanConf
-      .createWithDefault(false)
-
-  val ENABLE_READ_CSV_INTEGERS = conf("spark.rapids.sql.csv.read.integer.enabled")
-      .doc("Parsing CSV integers is much more lenient and will return 0 for some " +
-          "malformed values instead of null")
-      .booleanConf
-      .createWithDefault(false)
-
-  val ENABLE_READ_CSV_LONGS = conf("spark.rapids.sql.csv.read.long.enabled")
-      .doc("Parsing CSV longs is much more lenient and will return 0 for some " +
-          "malformed values instead of null")
-      .booleanConf
-      .createWithDefault(false)
-
-  val ENABLE_READ_CSV_FLOATS = conf("spark.rapids.sql.csv.read.float.enabled")
-      .doc("Parsing CSV floats has some issues at the min and max values for floating" +
-          "point numbers and can be more lenient on parsing inf and -inf values")
-      .booleanConf
-      .createWithDefault(false)
-
-  val ENABLE_READ_CSV_DOUBLES = conf("spark.rapids.sql.csv.read.double.enabled")
-      .doc("Parsing CSV double has some issues at the min and max values for floating" +
-          "point numbers and can be more lenient on parsing inf and -inf values")
-      .booleanConf
-      .createWithDefault(false)
-
   // INTERNAL TEST AND DEBUG CONFIGS
 
   val TEST_CONF = conf("spark.rapids.sql.test.enabled")
@@ -899,26 +807,6 @@ object RapidsConf {
       "the progress thread when needed, instead of a hot loop.")
     .booleanConf
     .createWithDefault(true)
-
-  val SHUFFLE_UCX_LISTENER_ENABLED = conf("spark.rapids.shuffle.ucx.listener.enabled")
-    .doc("When set to true, start listener and exchange socket address." +
-      " This improves detection of remote peer failures.")
-    .internal()
-    .booleanConf
-    .createWithDefault(false)
-
-  val SHUFFLE_UCX_USE_PEER_ERR_HDNL = conf("spark.rapids.shuffle.ucx.peerErrorHandling.enabled")
-    .doc("When set to true, enable peer error handling for UCX endpoints. " +
-      "This can impact transports and protocols selected in UCX.")
-    .internal()
-    .booleanConf
-    .createWithDefault(false)
-
-  val SHUFFLE_UCX_LISTENER_START_PORT = conf("spark.rapids.shuffle.ucx.listenerStartPort")
-    .doc("Starting port to try to bind the UCX listener.")
-    .internal()
-    .integerConf
-    .createWithDefault(0)
 
   val SHUFFLE_UCX_MGMT_SERVER_HOST = conf("spark.rapids.shuffle.ucx.managementServerHost")
     .doc("The host to be used to start the management server")
@@ -1016,9 +904,9 @@ object RapidsConf {
     .internal()
     .doc("Overrides the automatic Spark shim detection logic and forces a specific shims " +
       "provider class to be used. Set to the fully qualified shims provider class to use. " +
-      "If you are using a custom Spark version such as Spark 3.0.1.0 then this can be used to " +
-      "specify the shims provider that matches the base Spark version of Spark 3.0.1, i.e.: " +
-      "com.nvidia.spark.rapids.shims.spark301.SparkShimServiceProvider. If you modified Spark " +
+      "If you are using a custom Spark version such as Spark 3.0.0.0 then this can be used to " +
+      "specify the shims provider that matches the base Spark version of Spark 3.0.0, i.e.: " +
+      "com.nvidia.spark.rapids.shims.spark300.SparkShimServiceProvider. If you modified Spark " +
       "then there is no guarantee the RAPIDS Accelerator will function properly.")
     .stringConf
     .createOptional
@@ -1061,13 +949,6 @@ object RapidsConf {
       .doubleConf
       .createWithDefault(0.8)
 
-  val OPTIMIZER_CLASS_NAME = conf("spark.rapids.sql.optimizer.className")
-    .internal()
-    .doc("Optimizer implementation class name. The class must implement the " +
-      "com.nvidia.spark.rapids.Optimizer trait")
-    .stringConf
-    .createWithDefault("com.nvidia.spark.rapids.CostBasedOptimizer")
-
   val OPTIMIZER_DEFAULT_GPU_EXPRESSION_COST = conf("spark.rapids.sql.optimizer.defaultExprGpuCost")
       .internal()
       .doc("Default relative GPU cost of running an expression on the GPU")
@@ -1092,6 +973,12 @@ object RapidsConf {
     .doc("Option to turn off using the optimized Arrow copy code when reading from " +
       "ArrowColumnVector in HostColumnarToGpu. Left as internal as user shouldn't " +
       "have to turn it off, but its convenient for testing.")
+    .internal()
+    .booleanConf
+    .createWithDefault(true)
+
+  val CPU_RANGE_PARTITIONING_ALLOWED = conf("spark.rapids.allowCpuRangePartitioning")
+    .doc("Option to control enforcement of range partitioning on GPU.")
     .internal()
     .booleanConf
     .createWithDefault(true)
@@ -1126,7 +1013,7 @@ object RapidsConf {
         |On startup use: `--conf [conf key]=[conf value]`. For example:
         |
         |```
-        |${SPARK_HOME}/bin/spark --jars 'rapids-4-spark_2.12-0.6.0-SNAPSHOT.jar,cudf-0.20-SNAPSHOT-cuda11.jar' \
+        |${SPARK_HOME}/bin/spark --jars 'rapids-4-spark_2.12-0.5.0-SNAPSHOT.jar,cudf-0.19-SNAPSHOT-cuda10-1.jar' \
         |--conf spark.plugins=com.nvidia.spark.SQLPlugin \
         |--conf spark.rapids.sql.incompatibleOps.enabled=true
         |```
@@ -1316,20 +1203,6 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
 
   lazy val enableHashOptimizeSort: Boolean = get(ENABLE_HASH_OPTIMIZE_SORT)
 
-  lazy val areInnerJoinsEnabled: Boolean = get(ENABLE_INNER_JOIN)
-
-  lazy val areCrossJoinsEnabled: Boolean = get(ENABLE_CROSS_JOIN)
-
-  lazy val areLeftOuterJoinsEnabled: Boolean = get(ENABLE_LEFT_OUTER_JOIN)
-
-  lazy val areRightOuterJoinsEnabled: Boolean = get(ENABLE_RIGHT_OUTER_JOIN)
-
-  lazy val areFullOuterJoinsEnabled: Boolean = get(ENABLE_FULL_OUTER_JOIN)
-
-  lazy val areLeftSemiJoinsEnabled: Boolean = get(ENABLE_LEFT_SEMI_JOIN)
-
-  lazy val areLeftAntiJoinsEnabled: Boolean = get(ENABLE_LEFT_ANTI_JOIN)
-
   lazy val isCastFloatToDecimalEnabled: Boolean = get(ENABLE_CAST_FLOAT_TO_DECIMAL)
 
   lazy val isCastFloatToStringEnabled: Boolean = get(ENABLE_CAST_FLOAT_TO_STRING)
@@ -1342,29 +1215,11 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
 
   lazy val isCastFloatToIntegralTypesEnabled: Boolean = get(ENABLE_CAST_FLOAT_TO_INTEGRAL_TYPES)
 
-  lazy val isCsvTimestampReadEnabled: Boolean = get(ENABLE_CSV_TIMESTAMPS)
-
-  lazy val isCsvDateReadEnabled: Boolean = get(ENABLE_READ_CSV_DATES)
-
-  lazy val isCsvBoolReadEnabled: Boolean = get(ENABLE_READ_CSV_BOOLS)
-
-  lazy val isCsvByteReadEnabled: Boolean = get(ENABLE_READ_CSV_BYTES)
-
-  lazy val isCsvShortReadEnabled: Boolean = get(ENABLE_READ_CSV_SHORTS)
-
-  lazy val isCsvIntReadEnabled: Boolean = get(ENABLE_READ_CSV_INTEGERS)
-
-  lazy val isCsvLongReadEnabled: Boolean = get(ENABLE_READ_CSV_LONGS)
-
-  lazy val isCsvFloatReadEnabled: Boolean = get(ENABLE_READ_CSV_FLOATS)
-
-  lazy val isCsvDoubleReadEnabled: Boolean = get(ENABLE_READ_CSV_DOUBLES)
-
   lazy val isCastDecimalToStringEnabled: Boolean = get(ENABLE_CAST_DECIMAL_TO_STRING)
 
-  lazy val isParquetEnabled: Boolean = get(ENABLE_PARQUET)
+  lazy val isCsvTimestampEnabled: Boolean = get(ENABLE_CSV_TIMESTAMPS)
 
-  lazy val isParquetInt96WriteEnabled: Boolean = get(ENABLE_PARQUET_INT96_WRITE)
+  lazy val isParquetEnabled: Boolean = get(ENABLE_PARQUET)
 
   lazy val isParquetPerFileReadEnabled: Boolean =
     ParquetReaderType.withName(get(PARQUET_READER_TYPE)) == ParquetReaderType.PERFILE
@@ -1410,12 +1265,6 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
 
   lazy val shuffleUcxUseWakeup: Boolean = get(SHUFFLE_UCX_USE_WAKEUP)
 
-  lazy val shuffleUcxUseSockaddr: Boolean = get(SHUFFLE_UCX_LISTENER_ENABLED)
-
-  lazy val shuffleUcxUsePeerErrorHandler: Boolean = get(SHUFFLE_UCX_USE_PEER_ERR_HDNL)
-
-  lazy val shuffleUcxListenerStartPort: Int = get(SHUFFLE_UCX_LISTENER_START_PORT)
-
   lazy val shuffleUcxMgmtHost: String = get(SHUFFLE_UCX_MGMT_SERVER_HOST)
 
   lazy val shuffleUcxBounceBuffersSize: Long = get(SHUFFLE_UCX_BOUNCE_BUFFERS_SIZE)
@@ -1452,8 +1301,6 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
 
   lazy val optimizerExplain: String = get(OPTIMIZER_EXPLAIN)
 
-  lazy val optimizerClassName: String = get(OPTIMIZER_CLASS_NAME)
-
   lazy val defaultOperatorCost: Double = get(OPTIMIZER_DEFAULT_GPU_OPERATOR_COST)
 
   lazy val defaultExpressionCost: Double = get(OPTIMIZER_DEFAULT_GPU_EXPRESSION_COST)
@@ -1463,6 +1310,8 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
   lazy val defaultTransitionToGpuCost: Double = get(OPTIMIZER_DEFAULT_TRANSITION_TO_GPU_COST)
 
   lazy val getAlluxioPathsToReplace: Option[Seq[String]] = get(ALLUXIO_PATHS_REPLACE)
+
+  lazy val cpuRangePartitioningPermitted = get(CPU_RANGE_PARTITIONING_ALLOWED)
 
   def isOperatorEnabled(key: String, incompat: Boolean, isDisabledByDefault: Boolean): Boolean = {
     val default = !(isDisabledByDefault || incompat) || (incompat && isIncompatEnabled)

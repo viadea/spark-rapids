@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2021, NVIDIA CORPORATION.
+ * Copyright (c) 2019-2020, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -349,7 +349,7 @@ case class Instruction(opcode: Int, operand: Int, instructionStr: String) extend
   }
 
   private def pop(state: State): State = {
-    val State(locals, _ :: rest, cond, expr) = state
+    val State(locals, top :: rest, cond, expr) = state
     State(locals, rest, cond, expr)
   }
 
@@ -404,7 +404,7 @@ case class Instruction(opcode: Int, operand: Int, instructionStr: String) extend
   }
 
   private def checkcast(lambdaReflection: LambdaReflection, state: State): State = {
-    val State(_, top :: _, _, _) = state
+    val State(locals, top :: rest, cond, expr) = state
     val typeName = lambdaReflection.lookupClassName(operand)
     LambdaReflection.parseTypeSig(typeName).fold{
       // Defer the check until top is actually used.
@@ -419,19 +419,19 @@ case class Instruction(opcode: Int, operand: Int, instructionStr: String) extend
 
   private def ifCmp(state: State,
       predicate: (Expression, Expression) => Expression): State = {
-    val State(locals, op2 :: op1 :: rest, cond, _) = state
+    val State(locals, op2 :: op1 :: rest, cond, expr) = state
     State(locals, rest, cond, Some(predicate(op1, op2)))
   }
 
   private def ifOp(
       state: State,
       predicate: Expression => Expression): State = {
-    val State(locals, top :: rest, cond, _) = state
+    val State(locals, top :: rest, cond, expr) = state
     State(locals, rest, cond, Some(predicate(top)))
   }
 
   private def switch(state: State): State = {
-    val State(locals, top :: rest, cond, _) = state
+    val State(locals, top :: rest, cond, expr) = state
     State(locals, rest, cond, Some(top))
   }
 
@@ -448,27 +448,27 @@ case class Instruction(opcode: Int, operand: Int, instructionStr: String) extend
     // We support only some math and string methods.
     if (declaringClassName.equals("scala.math.package$")) {
       State(locals,
-        mathOp(method.getName, args) :: rest,
+        mathOp(lambdaReflection, method.getName, args) :: rest,
         cond,
         expr)
     } else if (declaringClassName.equals("scala.Predef$")) {
       State(locals,
-        predefOp(method.getName, args) :: rest,
+        predefOp(lambdaReflection, method.getName, args) :: rest,
         cond,
         expr)
     } else if (declaringClassName.equals("scala.Array$")) {
       State(locals,
-        arrayOp(method.getName, args) :: rest,
+        arrayOp(lambdaReflection, method.getName, args) :: rest,
         cond,
         expr)
     } else if (declaringClassName.equals("scala.reflect.ClassTag$")) {
       State(locals,
-        classTagOp(method.getName, args) :: rest,
+        classTagOp(lambdaReflection, method.getName, args) :: rest,
         cond,
         expr)
     } else if (declaringClassName.equals("scala.collection.mutable.ArrayBuffer$")) {
       State(locals,
-        arrayBufferOp(method.getName, args) :: rest,
+        arrayBufferOp(lambdaReflection, method.getName, args) :: rest,
         cond,
         expr)
     } else if (declaringClassName.equals("java.lang.Double")) {
@@ -490,7 +490,7 @@ case class Instruction(opcode: Int, operand: Int, instructionStr: String) extend
         newState
       }
     } else if (declaringClassName.equals("scala.collection.mutable.ArrayBuffer") ||
-               ((args.nonEmpty && args.head.isInstanceOf[Repr.ArrayBuffer]) &&
+               ((!args.isEmpty && args.head.isInstanceOf[Repr.ArrayBuffer]) &&
                 ((declaringClassName.equals("scala.collection.AbstractSeq") &&
                   opcode == Opcode.INVOKEVIRTUAL) ||
                  (declaringClassName.equals("scala.collection.TraversableOnce") &&
@@ -559,7 +559,8 @@ case class Instruction(opcode: Int, operand: Int, instructionStr: String) extend
     }
   }
 
-  private def mathOp(methodName: String, args: List[Expression]): Expression = {
+  private def mathOp(lambdaReflection: LambdaReflection,
+      methodName: String, args: List[Expression]): Expression = {
     // Math unary functions
     if (args.length != 2) {
       throw new SparkException(
@@ -597,7 +598,8 @@ case class Instruction(opcode: Int, operand: Int, instructionStr: String) extend
     }
   }
 
-  private def predefOp(methodName: String, args: List[Expression]): Expression = {
+  private def predefOp(lambdaReflection: LambdaReflection,
+      methodName: String, args: List[Expression]): Expression = {
     // Make sure that the objref is scala.math.package$.
     args.head match {
       case getstatic: Repr.GetStatic =>
@@ -619,7 +621,8 @@ case class Instruction(opcode: Int, operand: Int, instructionStr: String) extend
     }
   }
 
-  private def arrayOp(methodName: String, args: List[Expression]): Expression = {
+  private def arrayOp(lambdaReflection: LambdaReflection,
+      methodName: String, args: List[Expression]): Expression = {
     // Make sure that the objref is scala.math.package$.
     args.head match {
       case getstatic: Repr.GetStatic =>
@@ -660,7 +663,8 @@ case class Instruction(opcode: Int, operand: Int, instructionStr: String) extend
     }
   }
 
-  private def classTagOp(methodName: String, args: List[Expression]): Expression = {
+  private def classTagOp(lambdaReflection: LambdaReflection,
+      methodName: String, args: List[Expression]): Expression = {
     // Make sure that the objref is scala.math.package$.
     args.head match {
       case getstatic: Repr.GetStatic =>
@@ -694,7 +698,8 @@ case class Instruction(opcode: Int, operand: Int, instructionStr: String) extend
     }
   }
 
-  private def arrayBufferOp(methodName: String, args: List[Expression]): Expression = {
+  private def arrayBufferOp(lambdaReflection: LambdaReflection,
+      methodName: String, args: List[Expression]): Expression = {
     // Make sure that the objref is scala.math.package$.
     args.head match {
       case getstatic: Repr.GetStatic =>

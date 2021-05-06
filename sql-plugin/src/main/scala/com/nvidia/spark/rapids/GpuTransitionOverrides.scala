@@ -21,16 +21,17 @@ import java.lang.reflect.Method
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Ascending, Attribute, AttributeReference, Expression, InputFileBlockLength, InputFileBlockStart, InputFileName, SortOrder}
+import org.apache.spark.sql.catalyst.plans.physical.RangePartitioning
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.execution._
 import org.apache.spark.sql.execution.adaptive.{AdaptiveSparkPlanExec, BroadcastQueryStageExec, CustomShuffleReaderExec, QueryStageExec, ShuffleQueryStageExec}
 import org.apache.spark.sql.execution.columnar.InMemoryTableScanExec
 import org.apache.spark.sql.execution.command.ExecutedCommandExec
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2ScanExecBase
-import org.apache.spark.sql.execution.exchange.{BroadcastExchangeLike, Exchange, ReusedExchangeExec}
+import org.apache.spark.sql.execution.exchange.{Exchange, ReusedExchangeExec, ShuffleExchangeExec}
 import org.apache.spark.sql.execution.joins.{BroadcastHashJoinExec, BroadcastNestedLoopJoinExec}
 import org.apache.spark.sql.rapids.{GpuDataSourceScanExec, GpuFileSourceScanExec, GpuInputFileBlockLength, GpuInputFileBlockStart, GpuInputFileName, GpuShuffleEnv}
-import org.apache.spark.sql.rapids.execution.{GpuBroadcastExchangeExecBase, GpuBroadcastToCpuExec, GpuCustomShuffleReaderExec, GpuHashJoin, GpuShuffleExchangeExecBase}
+import org.apache.spark.sql.rapids.execution.{GpuBroadcastExchangeExecBase, GpuCustomShuffleReaderExec, GpuHashJoin, GpuShuffleExchangeExecBase}
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
 /**
@@ -134,16 +135,7 @@ class GpuTransitionOverrides extends Rule[SparkPlan] {
     // in future query stages. Note that because these query stages have already executed, we
     // don't need to recurse down and optimize them again
     case ColumnarToRowExec(e: BroadcastQueryStageExec) =>
-      e.plan match {
-        case ReusedExchangeExec(_, b: GpuBroadcastExchangeExecBase) =>
-          // we can't directly re-use a GPU broadcast exchange to feed a CPU broadcast
-          // hash join but Spark will sometimes try and do this (see
-          // https://issues.apache.org/jira/browse/SPARK-35093 for more information) so we
-          // need to convert the output to rows in the driver before broadcasting the data
-          // to the executors
-          GpuBroadcastToCpuExec(b.mode, b.child)
-        case _ => getColumnarToRowExec(e)
-      }
+      getColumnarToRowExec(e)
     case ColumnarToRowExec(e: ShuffleQueryStageExec) =>
       getColumnarToRowExec(optimizeAdaptiveTransitions(e, Some(plan)))
 
@@ -391,12 +383,17 @@ class GpuTransitionOverrides extends Rule[SparkPlan] {
     }
   }
 
+  private def getBaseNameFromClass(planClassStr: String): String = {
+    val firstDotIndex = planClassStr.lastIndexOf(".")
+    if (firstDotIndex != -1) planClassStr.substring(firstDotIndex + 1) else planClassStr
+  }
+
   def assertIsOnTheGpu(exp: Expression, conf: RapidsConf): Unit = {
     // There are no GpuAttributeReference or GpuSortOrder
     if (!exp.isInstanceOf[AttributeReference] &&
         !exp.isInstanceOf[SortOrder] &&
         !exp.isInstanceOf[GpuExpression] &&
-      !conf.testingAllowedNonGpu.contains(PlanUtils.getBaseNameFromClass(exp.getClass.toString))) {
+      !conf.testingAllowedNonGpu.contains(getBaseNameFromClass(exp.getClass.toString))) {
       throw new IllegalArgumentException(s"The expression $exp is not columnar ${exp.getClass}")
     }
     exp.children.foreach(subExp => assertIsOnTheGpu(subExp, conf))
@@ -405,7 +402,8 @@ class GpuTransitionOverrides extends Rule[SparkPlan] {
   def assertIsOnTheGpu(plan: SparkPlan, conf: RapidsConf): Unit = {
     val isAdaptiveEnabled = plan.conf.adaptiveExecutionEnabled
     plan match {
-      case _: BroadcastExchangeLike if isAdaptiveEnabled =>
+      case e: Exchange if isAdaptiveEnabled &&
+          ShimLoader.getSparkShims.isBroadcastExchangeLike(e) =>
         // broadcasts are left on CPU for now when AQE is enabled
       case _: BroadcastHashJoinExec | _: BroadcastNestedLoopJoinExec
           if isAdaptiveEnabled =>
@@ -423,17 +421,17 @@ class GpuTransitionOverrides extends Rule[SparkPlan] {
           throw new IllegalArgumentException("It looks like some operations were " +
             s"pushed down to InMemoryTableScanExec ${imts.expressions.mkString(",")}")
         }
+      case _: GpuColumnarToRowExecParent => () // Ignored
       case _: ExecutedCommandExec => () // Ignored
       case _: RDDScanExec => () // Ignored
-      case _ =>
+      case shuffleExchange: ShuffleExchangeExec if conf.cpuRangePartitioningPermitted
+        || !shuffleExchange.outputPartitioning.isInstanceOf[RangePartitioning] => {
+        // Ignored for now, we don't force it to the GPU if
+        // children are not on the gpu
+      }
+      case other =>
         if (!plan.supportsColumnar &&
-            // There are some python execs that are not columnar because of a little
-            // used feature. This prevents those from failing tests. This also allows
-            // the columnar to row transitions to not cause test issues because they too
-            // are not columnar (they output rows) but are instances of GpuExec.
-            !plan.isInstanceOf[GpuExec] && 
-            !conf.testingAllowedNonGpu.exists(nonGpuClass => 
-                PlanUtils.sameClass(plan, nonGpuClass))) {
+          !conf.testingAllowedNonGpu.contains(getBaseNameFromClass(other.getClass.toString))) {
           throw new IllegalArgumentException(s"Part of the plan is not columnar " +
             s"${plan.getClass}\n${plan}")
         }
@@ -461,7 +459,7 @@ class GpuTransitionOverrides extends Rule[SparkPlan] {
         validateExecs.contains(plan.getClass.getSimpleName)
       }
       // to set to make uniq execs
-      val execsFound = PlanUtils.findOperators(plan, planContainsInstanceOf).toSet
+      val execsFound = ShimLoader.getSparkShims.findOperators(plan, planContainsInstanceOf).toSet
       val execsNotFound = validateExecs.diff(execsFound.map(_.getClass().getSimpleName))
       require(execsNotFound.isEmpty,
         s"Plan ${plan.toString()} does not contain the following execs: " +

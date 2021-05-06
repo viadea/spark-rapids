@@ -99,13 +99,13 @@ configurations as we are able to test different scenarios.
 
 2. Within the Docker container we need to install UCX and its requirements. The following is an 
    example of a Docker container that shows how to install `rdma-core` and UCX 1.9.0 with 
-   `cuda-11.0` support. You can use this as a base layer for containers that your executors
+   `cuda-10.1` support. You can use this as a base layer for containers that your executors 
    will use.
    
    <a name="ucx-minimal-dockerfile"></a>
    
    ```
-   ARG CUDA_VER=11.0
+   ARG CUDA_VER=10.1
    
    # Throw away image to build rdma_core
    FROM ubuntu:18.04 as rdma_core
@@ -122,8 +122,8 @@ configurations as we are able to test different scenarios.
    COPY --from=rdma_core /*.deb /tmp/
    
    RUN apt update
-   RUN apt-get install -y cuda-compat-11-0 wget udev dh-make libnuma1 libudev-dev libnl-3-dev libnl-route-3-dev python3-dev cython3
-   RUN cd /tmp && wget https://github.com/openucx/ucx/releases/download/v1.9.0/ucx-v1.9.0-ubuntu18.04-mofed5.0-1.0.0.0-cuda11.0.deb
+   RUN apt-get install -y cuda-compat-10-1 wget udev dh-make libnuma1 libudev-dev libnl-3-dev libnl-route-3-dev python3-dev cython3
+   RUN cd /tmp && wget https://github.com/openucx/ucx/releases/download/v1.9.0/ucx-v1.9.0-ubuntu18.04-mofed5.0-1.0.0.0-cuda10.1.deb
    RUN dpkg -i /tmp/*.deb && rm -rf /tmp/*.deb
    ```
   
@@ -252,6 +252,8 @@ In this section, we are using a docker container built using the sample dockerfi
 
     | Spark Shim | spark.shuffle.manager value                              |
     | -----------| -------------------------------------------------------- |
+    | 3.0.0      | com.nvidia.spark.rapids.spark300.RapidsShuffleManager    |
+    | 3.0.0 EMR  | com.nvidia.spark.rapids.spark300emr.RapidsShuffleManager |
     | 3.0.1      | com.nvidia.spark.rapids.spark301.RapidsShuffleManager    |
     | 3.0.1 EMR  | com.nvidia.spark.rapids.spark301emr.RapidsShuffleManager |
     | 3.0.2      | com.nvidia.spark.rapids.spark302.RapidsShuffleManager    |
@@ -263,7 +265,7 @@ In this section, we are using a docker container built using the sample dockerfi
 2. Recommended settings for UCX 1.9.0+
 ```shell
 ...
---conf spark.shuffle.manager=com.nvidia.spark.rapids.spark301.RapidsShuffleManager \
+--conf spark.shuffle.manager=com.nvidia.spark.rapids.spark300.RapidsShuffleManager \
 --conf spark.shuffle.service.enabled=false \
 --conf spark.executorEnv.UCX_TLS=cuda_copy,cuda_ipc,rc,tcp \
 --conf spark.executorEnv.UCX_ERROR_SIGNALS= \
@@ -319,20 +321,3 @@ the [defaults](../configs.md) work in your case.
 This setting controls the amount of host memory (RAM) that can be utilized to spill GPU blocks when
 the GPU is out of memory, before going to disk. Please verify the [defaults](../configs.md).
 - `spark.rapids.memory.host.spillStorageSize`
-
-##### Shuffle Garbage Collection
-Shuffle buffers cached in the spillable store, whether they are in the GPU, host, or disk, will not
-be removed even after all actions for your query complete. This is a design decision in Spark, where 
-shuffle temporary stores are cleaned when there is a garbage collection on the driver, and the 
-references to the RDDs supporting your query are not reachable. 
-
-One of the issues with this is with large JVM footprints in the driver. The driver may not run a GC at
-all between different parts of your application, causing output for shuffle to accumulate (output that
-will not be reused), and eventually causing OOM or even filled disk. This is true for Spark even without
-the RAPIDS Shuffle Manager, but in our case it's likely GPU memory that is being occupied, and performance
-degrades given the churn due to spill to host memory or disk. As of this stage, there isn't a good solution 
-for this, other than to trigger a GC cycle on the driver.
-
-Spark has a configuration `spark.cleaner.periodicGC.interval` (defaults to 30 minutes), that 
-can be used to periodically cause garbage collection. If you are experiencing OOM situations, or 
-performance degradation with several Spark actions, consider tuning this setting in your jobs.

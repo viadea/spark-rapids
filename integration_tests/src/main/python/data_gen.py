@@ -252,29 +252,6 @@ class LongGen(DataGen):
     def start(self, rand):
         self._start(rand, lambda : rand.randint(self._min_val, self._max_val))
 
-class LongRangeGen(DataGen):
-    """Generate Longs in incrementing order."""
-    def __init__(self, nullable=False, start_val=0, direction="inc"):
-        super().__init__(LongType(), nullable=nullable)
-        self._start_val = start_val
-        self._current_val = start_val
-        if (direction == "dec"):
-            def dec_it():
-                tmp = self._current_val
-                self._current_val -= 1
-                return tmp
-            self._do_it = dec_it
-        else:
-            def inc_it():
-                tmp = self._current_val
-                self._current_val += 1
-                return tmp
-            self._do_it = inc_it
-
-    def start(self, rand):
-        self._current_val = self._start_val
-        self._start(rand, self._do_it)
-
 class RepeatSeqGen(DataGen):
     """Generate Repeated seq of `length` random items"""
     def __init__(self, child, length):
@@ -336,7 +313,7 @@ class FloatGen(DataGen):
 
     def _fixup_nans(self, v):
         if self._no_nans and (math.isnan(v) or v == math.inf or v == -math.inf):
-            v = None if self.nullable else 0.0
+            v = None
         return v
 
     def start(self, rand):
@@ -395,7 +372,7 @@ class DoubleGen(DataGen):
 
     def _fixup_nans(self, v):
         if self._no_nans and (math.isnan(v) or v == math.inf or v == -math.inf):
-            v = None if self.nullable else 0.0
+            v = None
         return v
 
     def start(self, rand):
@@ -830,8 +807,6 @@ date_n_time_gens = [date_gen, timestamp_gen]
 boolean_gens = [boolean_gen]
 
 single_level_array_gens = [ArrayGen(sub_gen) for sub_gen in all_basic_gens + decimal_gens + [null_gen]]
-
-single_level_array_gens_no_decimal = [ArrayGen(sub_gen) for sub_gen in all_basic_gens + [null_gen]]
 
 # Be careful to not make these too large of data generation takes for ever
 # This is only a few nested array gens, because nesting can be very deep

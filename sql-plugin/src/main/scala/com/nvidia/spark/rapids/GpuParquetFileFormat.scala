@@ -17,7 +17,6 @@
 package com.nvidia.spark.rapids
 
 import ai.rapids.cudf._
-import ai.rapids.cudf.ParquetColumnWriterOptions._
 import com.nvidia.spark.RebaseHelper
 import org.apache.hadoop.mapreduce.{Job, OutputCommitter, TaskAttemptContext}
 import org.apache.parquet.hadoop.{ParquetOutputCommitter, ParquetOutputFormat}
@@ -33,7 +32,7 @@ import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.internal.SQLConf.ParquetOutputTimestampType
 import org.apache.spark.sql.rapids.ColumnarWriteTaskStatsTracker
 import org.apache.spark.sql.rapids.execution.TrampolineUtil
-import org.apache.spark.sql.types.{ArrayType, DataTypes, DateType, Decimal, DecimalType, StructField, StructType, TimestampType}
+import org.apache.spark.sql.types.{ArrayType, DataType, DataTypes, DateType, DecimalType, StructType, TimestampType}
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
 object GpuParquetFileFormat {
@@ -42,6 +41,12 @@ object GpuParquetFileFormat {
       spark: SparkSession,
       options: Map[String, String],
       schema: StructType): Option[GpuParquetFileFormat] = {
+
+    val unSupportedTypes =
+      schema.filterNot(field => GpuOverrides.isSupportedType(field.dataType, allowDecimal = true))
+    if (unSupportedTypes.nonEmpty) {
+      meta.willNotWorkOnGpu(s"These types aren't supported for parquet $unSupportedTypes")
+    }
 
     val sqlConf = spark.sessionState.conf
     val parquetOptions = new ParquetOptions(options, sqlConf)
@@ -56,21 +61,12 @@ object GpuParquetFileFormat {
         s"${RapidsConf.ENABLE_PARQUET_WRITE} to true")
     }
 
-    FileFormatChecks.tag(meta, schema, ParquetFormatType, WriteFileOp)
-
     parseCompressionType(parquetOptions.compressionCodecClassName)
       .getOrElse(meta.willNotWorkOnGpu(
         s"compression codec ${parquetOptions.compressionCodecClassName} is not supported"))
 
     if (sqlConf.writeLegacyParquetFormat) {
-      meta.willNotWorkOnGpu("Spark legacy format is not supported")
-    }
-
-    if (!meta.conf.isParquetInt96WriteEnabled && sqlConf.parquetOutputTimestampType ==
-      ParquetOutputTimestampType.INT96) {
-      meta.willNotWorkOnGpu(s"Writing INT96 is disabled, if you want to enable it turn it on by " +
-        s"setting the ${RapidsConf.ENABLE_PARQUET_INT96_WRITE} to true. NOTE: check " +
-        "out the compatibility.md to know about the limitations associated with INT96 writer")
+      meta.willNotWorkOnGpu(s"Spark legacy format is not supported")
     }
 
     val schemaHasTimestamps = schema.exists { field =>
@@ -105,30 +101,18 @@ object GpuParquetFileFormat {
     }
   }
 
-  def parquetWriterOptionsFromSchema[T <: NestedBuilder[_, _], V <: ParquetColumnWriterOptions]
-  (builder: ParquetColumnWriterOptions.NestedBuilder[T, V], schema: StructType): T = {
-    // TODO once https://github.com/rapidsai/cudf/issues/7654 is fixed go back to actually
-    // setting if the output is nullable or not everywhere we have hard-coded nullable=true
-    schema.foreach(field =>
-      field.dataType match {
-        case dt: DecimalType =>
-          builder.withDecimalColumn(field.name, dt.precision, true)
-        case TimestampType =>
-          builder.withTimestampColumn(field.name,
-            ParquetOutputTimestampType.INT96 == SQLConf.get.parquetOutputTimestampType, true)
-        case s: StructType =>
-          builder.withStructColumn(
-            parquetWriterOptionsFromSchema(structBuilder(field.name), s).build())
-        case a: ArrayType =>
-          builder.withListColumn(
-            parquetWriterOptionsFromSchema(listBuilder(field.name),
-              StructType(Array(StructField(field.name, a.elementType, true))))
-              .build())
-        case _ =>
-          builder.withColumns(true, field.name)
+  def getPrecisionList(schema: StructType): Seq[Int] =  {
+    def precisionsList(t: DataType): Seq[Int] = {
+      t match {
+        case d: DecimalType => List(d.precision)
+        case _: StructType =>
+          throw new IllegalStateException("structs are not supported right now")
+        case _: ArrayType =>
+          throw new IllegalStateException("arrays are not supported right now")
+        case _ => List(0)
       }
-    )
-    builder.asInstanceOf[T]
+    }
+    schema.flatMap(f => precisionsList(f.dataType))
   }
 
   def parseCompressionType(compressionType: String): Option[CompressionType] = {
@@ -293,34 +277,7 @@ class GpuParquetWriter(
               new GpuColumnVector(DataTypes.TimestampType, withResource(cv.getBase()) { v =>
                 v.castTo(DType.TIMESTAMP_MILLISECONDS)
               })
-            case DataTypes.TimestampType
-              if outputTimestampType == ParquetOutputTimestampType.INT96.toString =>
-              withResource(Scalar.fromLong(Long.MaxValue / 1000)) { upper =>
-                withResource(Scalar.fromLong(Long.MinValue / 1000)) { lower =>
-                  withResource(cv.getBase().bitCastTo(DType.INT64)) { int64 =>
-                    withResource(int64.greaterOrEqualTo(upper)) { a =>
-                      withResource(int64.lessOrEqualTo(lower)) { b =>
-                        withResource(a.or(b)) { aOrB =>
-                          withResource(aOrB.any()) { any =>
-                            if (any.getBoolean()) {
-                              // its the writer's responsibility to close the batch
-                              batch.close()
-                              throw new IllegalArgumentException("INT96 column contains one " +
-                                "or more values that can overflow and will result in data " +
-                                "corruption. Please set " +
-                                "`spark.rapids.sql.format.parquet.writer.int96.enabled` to false" +
-                                " so we can fallback on CPU for writing parquet but still take " +
-                                "advantage of parquet read on the GPU.")
-                            }
-                          }
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-              cv
-            case d: DecimalType if d.precision <= Decimal.MAX_INT_DIGITS =>
+            case d: DecimalType if d.precision < 10 =>
               // There is a bug in Spark that causes a problem if we write Decimals with
               // precision < 10 as Decimal64.
               // https://issues.apache.org/jira/browse/SPARK-34167
@@ -335,12 +292,25 @@ class GpuParquetWriter(
     super.write(newBatch, statsTrackers)
   }
 
+
   override val tableWriter: TableWriter = {
     val writeContext = new ParquetWriteSupport().init(conf)
-    val builder = GpuParquetFileFormat
-      .parquetWriterOptionsFromSchema(ParquetWriterOptions.builder(), dataSchema)
+    val builder = ParquetWriterOptions.builder()
       .withMetadata(writeContext.getExtraMetaData)
       .withCompressionType(compressionType)
-    Table.writeParquetChunked(builder.build(), this)
+      .withTimestampInt96(outputTimestampType == ParquetOutputTimestampType.INT96)
+      .withDecimalPrecisions(GpuParquetFileFormat.getPrecisionList(dataSchema):_*)
+    dataSchema.foreach(entry => {
+      if (entry.nullable) {
+        builder.withColumnNames(entry.name)
+      } else {
+        builder.withColumnNames(entry.name)
+        // TODO once https://github.com/rapidsai/cudf/issues/7654 is fixed go back to actually
+        // setting if the output is nullable or not.
+        //builder.withNotNullableColumnNames(entry.name)
+      }
+    })
+    val options = builder.build()
+    Table.writeParquetChunked(options, this)
   }
 }

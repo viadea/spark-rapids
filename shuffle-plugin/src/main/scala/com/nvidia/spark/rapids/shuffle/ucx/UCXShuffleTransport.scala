@@ -64,11 +64,13 @@ class UCXShuffleTransport(shuffleServerId: BlockManagerId, rapidsConf: RapidsCon
   private[this] var hostSendBuffMgr: BounceBufferManager[HostMemoryBuffer] = null
   private[this] var deviceReceiveBuffMgr: BounceBufferManager[DeviceMemoryBuffer] = null
 
+  private[this] val executorId = shuffleServerId.executorId.toInt
+
   private[this] val clients = new ConcurrentHashMap[Long, RapidsShuffleClient]()
 
   private[this] lazy val ucx = {
     logWarning("UCX Shuffle Transport Enabled")
-    val ucxImpl = new UCX(shuffleServerId, rapidsConf)
+    val ucxImpl = new UCX(executorId, rapidsConf.shuffleUcxUseWakeup)
     ucxImpl.init()
 
     initBounceBufferPools(bounceBufferSize,
@@ -260,7 +262,7 @@ class UCXShuffleTransport(shuffleServerId: BlockManagerId, rapidsConf: RapidsCon
   // This will likely change.
   private[this] val serverExecutor = Executors.newSingleThreadExecutor(
     GpuDeviceManager.wrapThreadFactory(new ThreadFactoryBuilder()
-      .setNameFormat(s"shuffle-server-conn-thread-${shuffleServerId.executorId}-%d")
+      .setNameFormat(s"shuffle-server-conn-thread-${executorId}-%d")
       .setDaemon(true)
       .build))
 

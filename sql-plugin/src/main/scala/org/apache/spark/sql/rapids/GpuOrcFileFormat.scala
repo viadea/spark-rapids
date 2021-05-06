@@ -47,6 +47,11 @@ object GpuOrcFileFormat extends Logging {
                     options: Map[String, String],
                     schema: StructType): Option[GpuOrcFileFormat] = {
 
+    val unSupportedTypes = schema.filterNot(field => GpuOverrides.isSupportedType(field.dataType))
+    if (unSupportedTypes.nonEmpty) {
+      meta.willNotWorkOnGpu(s"These types aren't supported for orc $unSupportedTypes")
+    }
+
     if (!meta.conf.isOrcEnabled) {
       meta.willNotWorkOnGpu("ORC input and output has been disabled. To enable set" +
         s"${RapidsConf.ENABLE_ORC} to true")
@@ -56,8 +61,6 @@ object GpuOrcFileFormat extends Logging {
       meta.willNotWorkOnGpu("ORC output has been disabled. To enable set" +
         s"${RapidsConf.ENABLE_ORC_WRITE} to true")
     }
-
-    FileFormatChecks.tag(meta, schema, OrcFormatType, WriteFileOp)
 
     val sqlConf = spark.sessionState.conf
 

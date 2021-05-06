@@ -25,6 +25,7 @@ class BroadcastNestedLoopJoinSuite extends SparkQueryCompareTestSuite {
 
   test("BroadcastNestedLoopJoinExec AQE off") {
     val conf = new SparkConf()
+      .set("spark.rapids.sql.exec.BroadcastNestedLoopJoinExec", "true")
         .set(SQLConf.ADAPTIVE_EXECUTION_ENABLED.key, "false")
 
     withGpuSparkSession(spark => {
@@ -34,8 +35,8 @@ class BroadcastNestedLoopJoinSuite extends SparkQueryCompareTestSuite {
       df3.collect()
       val plan = df3.queryExecution.executedPlan
 
-      val nljCount =
-        PlanUtils.findOperators(plan, _.isInstanceOf[GpuBroadcastNestedLoopJoinExecBase])
+      val nljCount = ShimLoader.getSparkShims
+        .findOperators(plan, _.isInstanceOf[GpuBroadcastNestedLoopJoinExecBase])
       assert(nljCount.size === 1)
     }, conf)
   }
@@ -44,9 +45,6 @@ class BroadcastNestedLoopJoinSuite extends SparkQueryCompareTestSuite {
     val conf = new SparkConf()
         .set("spark.rapids.sql.exec.BroadcastNestedLoopJoinExec", "true")
         .set(SQLConf.ADAPTIVE_EXECUTION_ENABLED.key, "true")
-        // In some cases AQE can make the children not look like they are on the GPU
-        .set(RapidsConf.TEST_ALLOWED_NONGPU.key,
-          "ShuffleExchangeExec,RoundRobinPartitioning")
 
     withGpuSparkSession(spark => {
       val df1 = longsDf(spark).repartition(2)
@@ -55,8 +53,8 @@ class BroadcastNestedLoopJoinSuite extends SparkQueryCompareTestSuite {
       df3.collect()
       val plan = df3.queryExecution.executedPlan
 
-      val nljCount =
-        PlanUtils.findOperators(plan, _.isInstanceOf[GpuBroadcastNestedLoopJoinExecBase])
+      val nljCount = ShimLoader.getSparkShims
+        .findOperators(plan, _.isInstanceOf[GpuBroadcastNestedLoopJoinExecBase])
 
       ShimLoader.getSparkShims.getSparkShimVersion match {
         case SparkShimVersion(3, 0, 0) =>

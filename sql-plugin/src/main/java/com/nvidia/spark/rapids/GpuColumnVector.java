@@ -81,7 +81,7 @@ public class GpuColumnVector extends GpuColumnVectorBase {
    * @param name the name of the column to print out.
    * @param col the column to print out.
    */
-  public static synchronized void debug(String name, ai.rapids.cudf.ColumnView col) {
+  public static synchronized void debug(String name, ai.rapids.cudf.ColumnVector col) {
     try (HostColumnVector hostCol = col.copyToHost()) {
       debug(name, hostCol);
     }
@@ -106,7 +106,7 @@ public class GpuColumnVector extends GpuColumnVectorBase {
   public static synchronized void debug(String name, HostColumnVectorCore hostCol) {
     DType type = hostCol.getType();
     System.err.println("COLUMN " + name + " - " + type);
-    if (type.isDecimalType()) {
+    if (type.getTypeId() == DType.DTypeEnum.DECIMAL64) {
       for (int i = 0; i < hostCol.getRowCount(); i++) {
         if (hostCol.isNull(i)) {
           System.err.println(i + " NULL");
@@ -276,8 +276,13 @@ public class GpuColumnVector extends GpuColumnVectorBase {
     /**
      * A collection of builders for building up columnar data from Arrow data.
      * @param schema the schema of the batch.
+     * @param rows the maximum number of rows in this batch.
+     * @param batch if this is going to copy a ColumnarBatch in a non GPU format that batch
+     *              we are going to copy. If not this may be null. This is used to get an idea
+     *              of how big to allocate buffers that do not necessarily correspond to the
+     *              number of rows.
      */
-    public GpuArrowColumnarBatchBuilder(StructType schema) {
+    public GpuArrowColumnarBatchBuilder(StructType schema, int rows, ColumnarBatch batch) {
       fields = schema.fields();
       int len = fields.length;
       builders = new ai.rapids.cudf.ArrowColumnBuilder[len];
@@ -310,9 +315,9 @@ public class GpuColumnVector extends GpuColumnVectorBase {
       return gcv;
     }
 
-    public void copyColumnar(ColumnVector cv, int colNum, boolean ignored, int rows) {
+    public void copyColumnar(ColumnVector cv, int colNum, boolean nullable, int rows) {
       referenceHolders[colNum].addReferences(
-        HostColumnarToGpu.arrowColumnarCopy(cv, builder(colNum), rows)
+        HostColumnarToGpu.arrowColumnarCopy(cv, builder(colNum), nullable, rows)
       );
     }
 
@@ -340,8 +345,12 @@ public class GpuColumnVector extends GpuColumnVectorBase {
      * A collection of builders for building up columnar data.
      * @param schema the schema of the batch.
      * @param rows the maximum number of rows in this batch.
+     * @param batch if this is going to copy a ColumnarBatch in a non GPU format that batch
+     *              we are going to copy. If not this may be null. This is used to get an idea
+     *              of how big to allocate buffers that do not necessarily correspond to the
+     *              number of rows.
      */
-    public GpuColumnarBatchBuilder(StructType schema, int rows) {
+    public GpuColumnarBatchBuilder(StructType schema, int rows, ColumnarBatch batch) {
       fields = schema.fields();
       int len = fields.length;
       builders = new ai.rapids.cudf.HostColumnVector.ColumnBuilder[len];
@@ -414,7 +423,7 @@ public class GpuColumnVector extends GpuColumnVectorBase {
   }
 
   private static final class ArrowBufReferenceHolder {
-    private final List<ReferenceManager> references = new ArrayList<>();
+    private List<ReferenceManager> references = new ArrayList<>();
 
     public void addReferences(List<ReferenceManager> refs) {
       references.addAll(refs);
@@ -463,7 +472,8 @@ public class GpuColumnVector extends GpuColumnVectorBase {
       if (dt.precision() > DType.DECIMAL64_MAX_PRECISION) {
         return null;
       } else {
-        return DecimalUtil.createCudfDecimal(dt.precision(), dt.scale());
+        // Map all DecimalType to DECIMAL64, in case of underlying DType transaction.
+        return DType.create(DType.DTypeEnum.DECIMAL64, -dt.scale());
       }
     }
     return null;
@@ -486,7 +496,7 @@ public class GpuColumnVector extends GpuColumnVectorBase {
    * returning an empty batch from an operator is almost always the wrong thing to do.
    */
   public static ColumnarBatch emptyBatch(StructType schema) {
-    try (GpuColumnarBatchBuilder builder = new GpuColumnarBatchBuilder(schema, 0)) {
+    try (GpuColumnarBatchBuilder builder = new GpuColumnarBatchBuilder(schema, 0, null)) {
       return builder.build(0);
     }
   }
@@ -505,7 +515,7 @@ public class GpuColumnVector extends GpuColumnVectorBase {
    * when serializing an empty broadcast table.
    */
   public static HostColumnVector[] emptyHostColumns(StructType schema) {
-    try (GpuColumnarBatchBuilder builder = new GpuColumnarBatchBuilder(schema, 0)) {
+    try (GpuColumnarBatchBuilder builder = new GpuColumnarBatchBuilder(schema, 0, null)) {
       return builder.buildHostColumns();
     }
   }
@@ -671,8 +681,7 @@ public class GpuColumnVector extends GpuColumnVectorBase {
    */
   static boolean typeConversionAllowed(Table table, DataType[] colTypes) {
     final int numColumns = table.getNumberOfColumns();
-    assert numColumns == colTypes.length: "The number of columns and the number of types don't " +
-        "match " + table + " " + Arrays.toString(colTypes);
+    assert numColumns == colTypes.length: "The number of columns and the number of types don't match";
     boolean ret = true;
     for (int colIndex = 0; colIndex < numColumns; colIndex++) {
       ret = ret && typeConversionAllowed(table.getColumn(colIndex), colTypes[colIndex]);
@@ -855,6 +864,7 @@ public class GpuColumnVector extends GpuColumnVectorBase {
    */
   GpuColumnVector(DataType type, ai.rapids.cudf.ColumnVector cudfCv) {
     super(type);
+    // TODO need some checks to be sure everything matches
     this.cudfCv = cudfCv;
   }
 
@@ -903,8 +913,8 @@ public class GpuColumnVector extends GpuColumnVectorBase {
   public static long getTotalDeviceMemoryUsed(GpuColumnVector[] vectors) {
     long sum = 0;
     HashSet<Long> found = new HashSet<>();
-    for (GpuColumnVector vector : vectors) {
-      ai.rapids.cudf.ColumnVector cv = vector.getBase();
+    for (int i = 0; i < vectors.length; i++) {
+      ai.rapids.cudf.ColumnVector cv = vectors[i].getBase();
       long id = cv.getNativeView();
       if (found.add(id)) {
         sum += cv.getDeviceMemorySize();

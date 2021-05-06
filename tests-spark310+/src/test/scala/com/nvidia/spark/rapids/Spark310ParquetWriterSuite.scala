@@ -26,13 +26,11 @@ import org.mockito.ArgumentMatchers._
 import org.mockito.Mockito._
 import org.mockito.invocation.InvocationOnMock
 
-import org.apache.spark.SparkContext
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.AttributeReference
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.vectorized.ColumnarBatch
-import org.apache.spark.util.SerializableConfiguration
 
 
 /**
@@ -110,7 +108,7 @@ class Spark310ParquetWriterSuite extends SparkQueryCompareTestSuite {
     val splitRange = scala.Range(rowsAllowedInABatch.toInt, rows, rowsAllowedInABatch.toInt)
     scala.Range(0, cb.numCols()).indices.foreach { i =>
       val spyCol = cb.column(i).asInstanceOf[GpuColumnVector].getBase
-      val splitCols0 = splitRange.indices.map { _ =>
+      val splitCols0 = scala.Range(0, splitRange.length).map { _ =>
         val spySplitCol = spy(ColumnVector.fromBytes(4, 5, 6))
         when(spySplitCol.getRowCount()).thenReturn(rowsAllowedInABatch)
         spySplitCol
@@ -169,9 +167,8 @@ class Spark310ParquetWriterSuite extends SparkQueryCompareTestSuite {
       }
     }
     val ser = new ParquetCachedBatchSerializer
-
     val producer = new ser.CachedBatchIteratorProducer[ColumnarBatch](cbIter, schema,
-      withCpuSparkSession(spark => spark.sparkContext.broadcast(new SQLConf().getAllConfs)))
+      new Configuration(true), new SQLConf)
     val mockParquetOutputFileFormat = mock(classOf[ParquetOutputFileFormat])
     var totalSize = 0L
     val mockRecordWriter = new RecordWriter[Void, InternalRow] {
