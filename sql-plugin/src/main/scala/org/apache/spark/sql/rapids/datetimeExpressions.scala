@@ -298,6 +298,50 @@ case class GpuDateDiff(endDate: Expression, startDate: Expression)
   }
 }
 
+case class GpuDateFormatClass(timestamp: Expression,
+    format: Expression,
+    strfFormat: String,
+    timeZoneId: Option[String] = None)
+  extends GpuBinaryExpression with TimeZoneAwareExpression with ImplicitCastInputTypes {
+
+  override def dataType: DataType = StringType
+  override def inputTypes: Seq[AbstractDataType] = Seq(TimestampType, StringType)
+  override def left: Expression = timestamp
+
+  // we aren't using this "right" GpuExpression, as it was already converted in the GpuOverrides
+  // while creating the expressions map and passed down here as strfFormat
+  override def right: Expression = format
+  override def prettyName: String = "date_format"
+
+  override lazy val resolved: Boolean = childrenResolved && checkInputDataTypes().isSuccess
+
+  override def withTimeZone(timeZoneId: String): TimeZoneAwareExpression =
+    copy(timeZoneId = Option(timeZoneId))
+
+  override def doColumnar(lhs: GpuColumnVector, rhs: GpuColumnVector): ColumnVector = {
+    throw new IllegalArgumentException("rhs has to be a scalar for the date_format to work")
+  }
+
+  override def doColumnar(lhs: Scalar, rhs: GpuColumnVector): ColumnVector = {
+    throw new IllegalArgumentException("lhs has to be a vector and rhs has to be a scalar for " +
+        "the date_format to work")
+  }
+
+  override def doColumnar(lhs: GpuColumnVector, rhs: Scalar): ColumnVector = {
+    // we aren't using rhs as it was already converted in the GpuOverrides while creating the
+    // expressions map and passed down here as strfFormat
+    withResource(lhs.getBase.asTimestampSeconds) { tsVector =>
+      tsVector.asStrings(strfFormat)
+    }
+  }
+
+  override def doColumnar(numRows: Int, lhs: Scalar, rhs: Scalar): ColumnVector = {
+    withResource(GpuColumnVector.from(lhs, numRows, left.dataType)) { expandedLhs =>
+      doColumnar(expandedLhs, rhs)
+    }
+  }
+}
+
 case class GpuQuarter(child: Expression) extends GpuDateUnaryExpression {
   override def doColumnar(input: GpuColumnVector): ColumnVector = {
     val tmp = withResource(Scalar.fromInt(2)) { two =>
@@ -348,7 +392,8 @@ abstract class UnixTimeExprMeta[A <: BinaryExpression with TimeZoneAwareExpressi
               willNotWorkOnGpu("legacyTimeParserPolicy LEGACY is not supported")
             } else if (GpuToTimestamp.COMPATIBLE_FORMATS.contains(sparkFormat) ||
                 conf.incompatDateFormats) {
-              strfFormat = DateUtils.toStrf(sparkFormat)
+              strfFormat = DateUtils.toStrf(sparkFormat,
+                expr.left.dataType == DataTypes.StringType)
             } else {
               willNotWorkOnGpu(s"incompatible format '$sparkFormat'. Set " +
                   s"spark.rapids.sql.incompatibleDateFormats.enabled=true to force onto GPU.")
@@ -425,7 +470,6 @@ object GpuToTimestamp extends Arm {
       lhs: GpuColumnVector,
       sparkFormat: String,
       strfFormat: String,
-      timeParserPolicy: TimeParserPolicy,
       dtype: DType,
       daysScalar: String => Scalar,
       asTimestamp: (ColumnVector, String) => ColumnVector): ColumnVector = {
@@ -441,7 +485,7 @@ object GpuToTimestamp extends Arm {
           withResource(daysEqual(lhs.getBase, DateUtils.TODAY)) { isToday =>
             withResource(daysEqual(lhs.getBase, DateUtils.YESTERDAY)) { isYesterday =>
               withResource(daysEqual(lhs.getBase, DateUtils.TOMORROW)) { isTomorrow =>
-                withResource(lhs.getBase.isNull) { isNull =>
+                withResource(lhs.getBase.isNull) { _ =>
                   withResource(Scalar.fromNull(dtype)) { nullValue =>
                     withResource(asTimestamp(lhs.getBase, strfFormat)) { converted =>
                       withResource(daysScalar(DateUtils.EPOCH)) { epoch =>
@@ -517,7 +561,6 @@ abstract class GpuToTimestamp
         lhs,
         sparkFormat,
         strfFormat,
-        timeParserPolicy,
         DType.TIMESTAMP_MICROSECONDS,
         daysScalarMicros,
         (col, strfFormat) => col.asTimestampMicroseconds(strfFormat))
@@ -560,7 +603,6 @@ abstract class GpuToTimestampImproved extends GpuToTimestamp {
         lhs,
         sparkFormat,
         strfFormat,
-        timeParserPolicy,
         DType.TIMESTAMP_SECONDS,
         daysScalarSeconds,
         (col, strfFormat) => col.asTimestampSeconds(strfFormat))

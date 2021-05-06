@@ -23,7 +23,6 @@ import org.apache.spark.sql.catalyst.plans.{ExistenceJoin, FullOuter, InnerLike,
 import org.apache.spark.sql.execution.SortExec
 import org.apache.spark.sql.execution.joins.SortMergeJoinExec
 import org.apache.spark.sql.rapids.execution.GpuHashJoin
-import org.apache.spark.sql.types.DataType
 
 /**
  * HashJoin changed in Spark 3.1 requiring Shim
@@ -78,14 +77,15 @@ class GpuSortMergeJoinMeta(
     } else {
       throw new IllegalStateException(s"Cannot build either side for ${join.joinType} join")
     }
+    val Seq(left, right) = childPlans.map(_.convertIfNeeded())
     GpuShuffledHashJoinExec(
       leftKeys.map(_.convertToGpu()),
       rightKeys.map(_.convertToGpu()),
       join.joinType,
       GpuJoinUtils.getGpuBuildSide(buildSide),
       condition.map(_.convertToGpu()),
-      childPlans(0).convertIfNeeded(),
-      childPlans(1).convertIfNeeded(),
+      left,
+      right,
       join.isSkewJoin)
   }
 

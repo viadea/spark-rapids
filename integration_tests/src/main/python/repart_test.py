@@ -14,10 +14,10 @@
 
 import pytest
 
-from asserts import assert_gpu_and_cpu_are_equal_collect
+from asserts import assert_gpu_and_cpu_are_equal_collect, assert_gpu_fallback_collect
 from spark_session import is_before_spark_311
 from data_gen import *
-from marks import ignore_order
+from marks import ignore_order, allow_non_gpu
 import pyspark.sql.functions as f
 
 nested_scalar_mark=pytest.mark.xfail(reason="https://github.com/NVIDIA/spark-rapids/issues/1459")
@@ -63,15 +63,35 @@ def test_coalesce_df(num_parts, length):
     assert_gpu_and_cpu_are_equal_collect(
             lambda spark : gen_df(spark, gen_list, length=length).coalesce(num_parts))
 
-@pytest.mark.parametrize('num_parts', [1, 10, 100, 1000, 2000], ids=idfn)
+@pytest.mark.parametrize('data_gen', [
+    pytest.param([('_c' + str(i), gen) for i, gen in enumerate(all_basic_gens + decimal_gens)]),
+    pytest.param([('s', StructGen([['child0', all_basic_struct_gen]]))]),
+    pytest.param([('a', ArrayGen(string_gen))]),
+], ids=idfn)
+@pytest.mark.parametrize('num_parts', [1, 10, 2345], ids=idfn)
 @pytest.mark.parametrize('length', [0, 2048, 4096], ids=idfn)
 @ignore_order(local=True) # To avoid extra data shuffle by 'sort on Spark' for this repartition test.
-def test_repartion_df(num_parts, length):
-    #This should change eventually to be more than just the basic gens
-    gen_list = [('_c' + str(i), gen) for i, gen in enumerate(all_basic_gens + decimal_gens)]
+def test_repartition_df(data_gen, num_parts, length):
+    from pyspark.sql.functions import lit
     assert_gpu_and_cpu_are_equal_collect(
-            lambda spark : gen_df(spark, gen_list, length=length).repartition(num_parts),
-            conf = allow_negative_scale_of_decimal_conf)
+            # Add a computed column to avoid shuffle being optimized back to a CPU shuffle
+            lambda spark : gen_df(spark, data_gen, length=length).withColumn('x', lit(1)).repartition(num_parts),
+            # disable sort before shuffle so round robin works for arrays
+            conf = {'spark.sql.execution.sortBeforeRepartition': 'false',
+                'spark.sql.legacy.allowNegativeScaleOfDecimal': 'true'})
+
+@allow_non_gpu('ShuffleExchangeExec', 'RoundRobinPartitioning')
+@pytest.mark.parametrize('data_gen', [[('a', ArrayGen(string_gen))],
+    [('a', StructGen([('a_1', StructGen([('a_1_1', int_gen)]))]))],
+    [('a', simple_string_to_string_map_gen)]], ids=idfn)
+@ignore_order(local=True) # To avoid extra data shuffle by 'sort on Spark' for this repartition test.
+def test_round_robin_sort_fallback(data_gen):
+    from pyspark.sql.functions import lit
+    assert_gpu_fallback_collect(
+            # Add a computed column to avoid shuffle being optimized back to a CPU shuffle like in test_repartition_df
+            lambda spark : gen_df(spark, data_gen).withColumn('x', lit(1)).repartition(13),
+            'ShuffleExchangeExec')
+
 
 @ignore_order(local=True) # To avoid extra data shuffle by 'sort on Spark' for this repartition test.
 @pytest.mark.parametrize('num_parts', [1, 2, 10, 17, 19, 32], ids=idfn)
@@ -92,6 +112,7 @@ def test_repartion_df(num_parts, length):
     ([('a', decimal_gen_64bit)], ['a']),
     ([('a', string_gen)], ['a']),
     ([('a', null_gen)], ['a']),
+    ([('a', StructGen([('c0', boolean_gen), ('c1', StructGen([('c1_0', byte_gen), ('c1_1', string_gen), ('c1_2', boolean_gen)]))]))], ['a']), 
     ([('a', long_gen), ('b', StructGen([('b1', long_gen)]))], ['a']),
     ([('a', long_gen), ('b', ArrayGen(long_gen, max_length=2))], ['a']),
     ([('a', byte_gen)], [f.col('a') - 5]), 

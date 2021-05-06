@@ -42,7 +42,8 @@ from typing import Iterator, Tuple
 
 arrow_udf_conf = {
     'spark.sql.execution.arrow.pyspark.enabled': 'true',
-    'spark.rapids.sql.exec.WindowInPandasExec': 'true'
+    'spark.rapids.sql.exec.WindowInPandasExec': 'true',
+    'spark.rapids.sql.exec.AggregateInPandasExec': 'true'
 }
 
 data_gens_nested_for_udf = arrow_array_gens + arrow_struct_gens
@@ -91,8 +92,8 @@ def test_pandas_scalar_udf_nested_type(data_gen):
         conf=arrow_udf_conf)
 
 
+@allow_non_gpu('PythonUDF', 'Alias')
 @approximate_float
-@allow_non_gpu('AggregateInPandasExec', 'PythonUDF', 'Alias')
 @pytest.mark.parametrize('data_gen', integral_gens, ids=idfn)
 def test_single_aggregate_udf(data_gen):
     @f.pandas_udf('double')
@@ -106,7 +107,7 @@ def test_single_aggregate_udf(data_gen):
 
 
 @ignore_order
-@allow_non_gpu('AggregateInPandasExec', 'PythonUDF', 'Alias')
+@allow_non_gpu('PythonUDF', 'Alias')
 @pytest.mark.parametrize('data_gen', integral_gens, ids=idfn)
 def test_group_aggregate_udf(data_gen):
     @f.pandas_udf('long')
@@ -187,7 +188,6 @@ def test_window_aggregate_udf_array_from_python(data_gen, window):
 
 # ======= Test flat map group in Pandas =======
 @ignore_order
-@allow_non_gpu('FlatMapGroupsInPandasExec', 'PythonUDF', 'Alias')
 @pytest.mark.parametrize('data_gen', [LongGen()], ids=idfn)
 def test_group_apply_udf(data_gen):
     def pandas_add(data):
@@ -201,6 +201,20 @@ def test_group_apply_udf(data_gen):
             conf=arrow_udf_conf)
 
 
+@ignore_order
+@pytest.mark.parametrize('data_gen', arrow_common_gen, ids=idfn)
+def test_group_apply_udf_more_types(data_gen):
+    def group_size_udf(key, pdf):
+        return pd.DataFrame([[len(key), len(pdf), len(pdf.columns)]])
+
+    assert_gpu_and_cpu_are_equal_collect(
+        lambda spark: binary_op_df(spark, data_gen, 5)\
+            .groupBy('a')\
+            .applyInPandas(group_size_udf, schema="c long, d long, e long"),
+        conf=arrow_udf_conf)
+
+
+# ======= Test map in Pandas =======
 @pytest.mark.parametrize('data_gen', [LongGen()], ids=idfn)
 def test_map_apply_udf(data_gen):
     def pandas_filter(iterator):

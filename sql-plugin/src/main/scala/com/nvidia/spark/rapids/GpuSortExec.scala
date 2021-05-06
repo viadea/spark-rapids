@@ -21,7 +21,6 @@ import java.util.{Comparator, LinkedList, PriorityQueue}
 import scala.collection.mutable.ArrayBuffer
 
 import ai.rapids.cudf.{ColumnVector, ContiguousTable, NvtxColor, NvtxRange, Table}
-import com.nvidia.spark.rapids.GpuColumnVector.GpuColumnarBatchBuilder
 import com.nvidia.spark.rapids.GpuMetric._
 
 import org.apache.spark.TaskContext
@@ -284,27 +283,26 @@ case class GpuOutOfCoreSortIterator(
     // Protect ourselves from large rows when there are small targetSizes
     val targetRowCount = Math.max((targetBatchSize/averageRowSize).toInt, 1024)
 
-    if (sortedOffset == rows - 1) {
+    if (sortedOffset == rows) {
       // The entire thing is sorted
       withResource(sortedTbl.contiguousSplit()) { splits =>
         assert(splits.length == 1)
-        memUsed += splits.head.getBuffer.getLength
-        closeOnExcept(
-          GpuColumnVectorFromBuffer.from(splits.head, sorter.projectedBatchTypes)) { cb =>
-          val sp = SpillableColumnarBatch(cb, SpillPriorities.ACTIVE_ON_DECK_PRIORITY,
-            spillCallback)
-          sortedSize += sp.sizeInBytes
-          sorted.add(sp)
-        }
+        val ct = splits.head
+        memUsed += ct.getBuffer.getLength
+        val sp = SpillableColumnarBatch(ct, sorter.projectedBatchTypes,
+          SpillPriorities.ACTIVE_ON_DECK_PRIORITY, spillCallback)
+        sortedSize += sp.sizeInBytes
+        sorted.add(sp)
       }
     } else {
-      val splitIndexes = if (sortedOffset >= 0) {
+      val hasFullySortedData = sortedOffset > 0
+      val splitIndexes = if (hasFullySortedData) {
         sortedOffset until rows by targetRowCount
       } else {
         targetRowCount until rows by targetRowCount
       }
       // Get back the first row so we can sort the batches
-      val gatherIndexes = if (sortedOffset >= 0) {
+      val gatherIndexes = if (hasFullySortedData) {
         // The first batch is sorted so don't gather a row for it
         splitIndexes
       } else {
@@ -325,14 +323,11 @@ case class GpuOutOfCoreSortIterator(
 
       withResource(sortedTbl.contiguousSplit(splitIndexes: _*)) { splits =>
         memUsed += splits.map(_.getBuffer.getLength).sum
-        val stillPending = if (sortedOffset >= 0) {
-          closeOnExcept(
-            GpuColumnVectorFromBuffer.from(splits.head, sorter.projectedBatchTypes)) { cb =>
-            val sp = SpillableColumnarBatch(cb, SpillPriorities.ACTIVE_ON_DECK_PRIORITY,
-              spillCallback)
-            sortedSize += sp.sizeInBytes
-            sorted.add(sp)
-          }
+        val stillPending = if (hasFullySortedData) {
+          val sp = SpillableColumnarBatch(splits.head, sorter.projectedBatchTypes,
+            SpillPriorities.ACTIVE_ON_DECK_PRIORITY, spillCallback)
+          sortedSize += sp.sizeInBytes
+          sorted.add(sp)
           splits.slice(1, splits.length)
         } else {
           splits
@@ -342,11 +337,9 @@ case class GpuOutOfCoreSortIterator(
         stillPending.zip(boundaries).foreach {
           case (ct: ContiguousTable, lower: UnsafeRow) =>
             if (ct.getRowCount > 0) {
-              closeOnExcept(
-                GpuColumnVectorFromBuffer.from(ct, sorter.projectedBatchTypes)) { cb =>
-                pending.add(SpillableColumnarBatch(cb, SpillPriorities.ACTIVE_BATCHING_PRIORITY,
-                  spillCallback), lower)
-              }
+              val sp = SpillableColumnarBatch(ct, sorter.projectedBatchTypes,
+                SpillPriorities.ACTIVE_ON_DECK_PRIORITY, spillCallback)
+              pending.add(sp, lower)
             } else {
               ct.close()
             }
@@ -425,7 +418,7 @@ case class GpuOutOfCoreSortIterator(
         // First we want figure out what is fully sorted from what is not
         val sortSplitOffset = if (pending.isEmpty) {
           // No need to split it
-          mergedBatch.numRows() - 1
+          mergedBatch.numRows()
         } else {
           // The data is only fully sorted if there is nothing pending that is smaller than it
           // so get the next "smallest" row that is pending.
@@ -440,7 +433,7 @@ case class GpuOutOfCoreSortIterator(
             }
           }
         }
-        if (sortSplitOffset == mergedBatch.numRows() - 1 && sorted.isEmpty &&
+        if (sortSplitOffset == mergedBatch.numRows() && sorted.isEmpty &&
             (GpuColumnVector.getTotalDeviceMemoryUsed(mergedBatch) >= targetSize ||
                 pending.isEmpty)) {
           // This is a special case where we have everything we need to output already so why
@@ -496,16 +489,17 @@ case class GpuOutOfCoreSortIterator(
     if (sorter.projectedBatchSchema.isEmpty) {
       // special case, no columns just rows
       iter.next()
-    }
-    if (pending.isEmpty && sorted.isEmpty) {
-      firstPassReadBatches()
-    }
-    withResource(new NvtxWithMetrics("Sort next output batch", NvtxColor.CYAN, totalTime)) { _ =>
-      val ret = mergeSortEnoughToOutput().getOrElse(concatOutput())
-      outputBatches += 1
-      outputRows += ret.numRows()
-      peakDevMemory.set(Math.max(peakMemory, peakDevMemory.value))
-      ret
+    } else {
+      if (pending.isEmpty && sorted.isEmpty) {
+        firstPassReadBatches()
+      }
+      withResource(new NvtxWithMetrics("Sort next output batch", NvtxColor.CYAN, totalTime)) { _ =>
+        val ret = mergeSortEnoughToOutput().getOrElse(concatOutput())
+        outputBatches += 1
+        outputRows += ret.numRows()
+        peakDevMemory.set(Math.max(peakMemory, peakDevMemory.value))
+        ret
+      }
     }
   }
 
