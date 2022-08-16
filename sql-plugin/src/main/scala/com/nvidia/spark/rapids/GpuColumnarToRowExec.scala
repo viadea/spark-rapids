@@ -353,7 +353,8 @@ object GpuColumnarToRowExec {
     // Check if the current CUDA device architecture exceeds Pascal.
     // i.e. CUDA compute capability > 6.x.
     // Reference:  https://developer.nvidia.com/cuda-gpus
-    Cuda.getComputeCapabilityMajor > 6
+    //Cuda.getComputeCapabilityMajor > 6
+    false
   }
 
   def makeIteratorFunc(
