@@ -22,7 +22,7 @@ import scala.collection.JavaConverters.asScalaIteratorConverter
 import scala.concurrent.ExecutionContext
 import scala.concurrent.duration.Duration
 
-import com.nvidia.spark.rapids.{BaseExprMeta, DataFromReplacementRule, GpuColumnarToRowExec, GpuExec, GpuMetric, RapidsConf, RapidsMeta, SparkPlanMeta, TargetSize}
+import com.nvidia.spark.rapids.{BaseExprMeta, DataFromReplacementRule, GpuColumnarToRowExec, GpuColumnVector, GpuExec, GpuMetric, RapidsConf, RapidsMeta, SparkPlanMeta, SpillableColumnarBatch, SpillPriorities, TargetSize}
 import com.nvidia.spark.rapids.Arm.withResource
 import com.nvidia.spark.rapids.GpuMetric.{COLLECT_TIME, DESCRIPTION_COLLECT_TIME, ESSENTIAL_LEVEL}
 import com.nvidia.spark.rapids.shims.{ShimBaseSubqueryExec, ShimUnaryExecNode, SparkShimImpl}
@@ -301,6 +301,51 @@ case class GpuSubqueryBroadcastExec(
     ThreadUtils.awaitResult(relationFuture, Duration.Inf)
   }
 
+  /**
+   * Layer 2: GPU-resident equivalent of [[executeCollect]]. Returns a borrowed reference to a
+   * [[SpillableColumnarBatch]] that contains the projected DPP filter values, suitable for use
+   * as the right-hand side of a GPU `IN` predicate or semi-join. The batch is owned by the
+   * underlying broadcast value (cleaned up via `closeInternal`); callers MUST NOT close it.
+   *
+   * This is intentionally distinct from `relationFuture`/`executeCollect` so existing CPU-style
+   * consumers (Spark's `InSubqueryExec` calling `executeCollect`) continue to work unchanged.
+   * GPU consumers (a future `GpuInSubqueryExec` / `GpuDynamicPruningFilter`) call this instead.
+   *
+   * The compute path:
+   *   - If the broadcast batch is already resident on the GPU (`maybeGpuBatch.isDefined`), we
+   *     just project the requested column indices on the device (cheap column selection plus
+   *     an optional gather for the mode-key projection in the future).
+   *   - Otherwise we fall back to the host-side projection (Layer 1 array) and lift it to the
+   *     GPU once.
+   *
+   * Both branches converge on the same SpillableColumnarBatch shape so downstream consumers
+   * don't need to know which path produced it.
+   */
+  def gpuProjectedRowsBatch(): SpillableColumnarBatch = {
+    val broadcastBatch = child.executeBroadcast[Any]()
+    broadcastBatch.value match {
+      case b: SerializeConcatHostBuffersDeserializeBatch =>
+        val key = ProjectedRowsKey(
+          "subquery",
+          indices,
+          buildKeys.map(_.canonicalized),
+          modeKeys.map(_.map(_.canonicalized)))
+        b.projectedGpuBatchOrCompute(key) {
+          GpuSubqueryBroadcastExec.computeGpuProjectedBatch(b, indices, dataTypes)
+        }
+      case b if SparkShimImpl.isEmptyRelation(b) =>
+        SpillableColumnarBatch(
+          GpuColumnVector.emptyBatchFromTypes(dataTypes),
+          SpillPriorities.ACTIVE_BATCHING_PRIORITY)
+      case b =>
+        throw new IllegalStateException(s"Unexpected broadcast type: ${b.getClass}")
+    }
+  }
+
+  /** dataTypes for the projected key columns, in `indices` order. */
+  private lazy val dataTypes: Array[org.apache.spark.sql.types.DataType] =
+    indices.map(idx => buildKeys(idx).dataType).toArray
+
   override protected def internalDoExecuteColumnar(): RDD[ColumnarBatch] = {
     throw new IllegalStateException(s"Internal Error ${this.getClass} has column support" +
         s" mismatch:\n$this")
@@ -311,4 +356,49 @@ object GpuSubqueryBroadcastExec {
   private[execution] val executionContext = ExecutionContext.fromExecutorService(
     ThreadUtils.newDaemonCachedThreadPool("dynamicpruning",
       SQLConf.get.getConf(StaticSQLConf.BROADCAST_EXCHANGE_MAX_THREAD_THRESHOLD)))
+
+  /**
+   * Layer 2: produce a GPU-resident SpillableColumnarBatch containing only the projected
+   * key columns at `indices`. Assumes `modeKeys` is empty for now, matching the only
+   * SubqueryBroadcast shape produced by Spark today (IdentityBroadcastMode for the DPP
+   * subquery's broadcast). A non-identity mode would require evaluating the mode-key
+   * projection on GPU here; until that path is exercised we throw rather than silently
+   * mis-project.
+   *
+   * Memory contract:
+   *   - `b.batch` is memoized inside `SerializeConcatHostBuffersDeserializeBatch`, so the
+   *     first caller pays the host->device materialization cost once. We then select the
+   *     projected columns into a NEW caller-owned SpillableColumnarBatch and return it.
+   *   - The returned batch is OWNED by the L2 projectedGpuBatchCache and will be closed in
+   *     `SerializeConcatHostBuffersDeserializeBatch.closeInternal`. Borrowed by callers.
+   */
+  private[execution] def computeGpuProjectedBatch(
+      b: SerializeConcatHostBuffersDeserializeBatch,
+      indices: Seq[Int],
+      dataTypes: Array[org.apache.spark.sql.types.DataType]): SpillableColumnarBatch = {
+    val spillable = b.batch
+    withResource(spillable.getColumnarBatch()) { fullBatch =>
+      val numRows = fullBatch.numRows()
+      val projectedCols = indices.map { idx =>
+        fullBatch.column(idx) match {
+          case gpu: GpuColumnVector =>
+            // incRefCount so the new batch survives the close of fullBatch (and any future
+            // spill of the source broadcast batch).
+            GpuColumnVector.from(gpu.getBase.incRefCount(), gpu.dataType())
+          case other =>
+            throw new IllegalStateException(
+              s"Expected GpuColumnVector in broadcast batch but got ${other.getClass}")
+        }
+      }.toArray[org.apache.spark.sql.vectorized.ColumnVector]
+      val projectedBatch = new ColumnarBatch(projectedCols, numRows)
+      // Sanity check on dataTypes ordering. Cheap and saves debugging mismatches later.
+      indices.zipWithIndex.foreach { case (_, i) =>
+        require(projectedCols(i).asInstanceOf[GpuColumnVector].dataType() == dataTypes(i),
+          s"GpuSubqueryBroadcastExec L2 column ${i} dataType mismatch: " +
+            s"got ${projectedCols(i).asInstanceOf[GpuColumnVector].dataType()}, " +
+            s"expected ${dataTypes(i)}")
+      }
+      SpillableColumnarBatch(projectedBatch, SpillPriorities.ACTIVE_BATCHING_PRIORITY)
+    }
+  }
 }

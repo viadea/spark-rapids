@@ -110,7 +110,23 @@ class SerializeConcatHostBuffersDeserializeBatch(
   @transient private lazy val projectedRowsCache =
     new ConcurrentHashMap[ProjectedRowsKey, Array[InternalRow]]()
 
-  private def maybeGpuBatch: Option[SpillableColumnarBatch] = Option(batchInternal)
+  /**
+   * Layer 2 cache: memoized GPU-resident projection of the broadcast columns, keyed by the
+   * same projection spec as Layer 1. When DPP consumers can keep the broadcast filter on the
+   * GPU (see GpuInSubqueryExec / GpuDynamicPruningFilter), we avoid the GPU->host->GPU
+   * round-trip entirely: the broadcast lands once as `batchInternal`, gets projected once
+   * into a small SpillableColumnarBatch, and is reused across all probe sites for this
+   * broadcast.
+   *
+   * The values are SpillableColumnarBatch and therefore AutoCloseable - we own them until
+   * `closeInternal` runs at GC, so callers MUST treat the returned batch as borrowed (do
+   * NOT close it). Use `getColumnarBatch()` on the SpillableColumnarBatch to materialize a
+   * usable ColumnarBatch (which the caller does close).
+   */
+  @transient private lazy val projectedGpuBatchCache =
+    new ConcurrentHashMap[ProjectedRowsKey, SpillableColumnarBatch]()
+
+  private[execution] def maybeGpuBatch: Option[SpillableColumnarBatch] = Option(batchInternal)
 
   /**
    * Compute the projected `Array[InternalRow]` for `key` exactly once per executor for this
@@ -136,6 +152,38 @@ class SerializeConcatHostBuffersDeserializeBatch(
       val fresh = compute
       val winner = projectedRowsCache.putIfAbsent(key, fresh)
       if (winner == null) fresh else winner
+    }
+  }
+
+  /**
+   * Layer 2: compute a GPU-resident projection of the broadcast columns exactly once per
+   * executor for this broadcast value, and return the same memoized SpillableColumnarBatch
+   * for subsequent calls with an equal key.
+   *
+   * The returned [[SpillableColumnarBatch]] is OWNED by this broadcast value and will be
+   * closed in `closeInternal` (i.e. when the broadcast itself is collected). Callers MUST
+   * NOT close the returned batch; instead, call `getColumnarBatch()` on it to obtain a
+   * usable, caller-owned ColumnarBatch.
+   *
+   * If `compute` throws, the cache stays unpopulated for `key` and the next caller will retry.
+   * If a race between two callers both produce a SpillableColumnarBatch, the loser is closed
+   * here so callers never have to worry about leaks from the race.
+   */
+  def projectedGpuBatchOrCompute(
+      key: ProjectedRowsKey)(compute: => SpillableColumnarBatch): SpillableColumnarBatch = {
+    val existing = projectedGpuBatchCache.get(key)
+    if (existing != null) {
+      existing
+    } else {
+      val fresh = compute
+      val winner = projectedGpuBatchCache.putIfAbsent(key, fresh)
+      if (winner == null) {
+        fresh
+      } else {
+        // Lost the race; close our locally produced batch and return the cached one.
+        fresh.close()
+        winner
+      }
     }
   }
 
@@ -304,11 +352,19 @@ class SerializeConcatHostBuffersDeserializeBatch(
     Seq(data, batchInternal).safeClose()
     data = null
     batchInternal = null
-    // Drop the projected-row memoizations so the InternalRow arrays become collectable.
-    // Safe to call on `null` because `projectedRowsCache` is a lazy val initialized on first
-    // touch; clear() on an initialized map releases the entries, and a never-touched map
-    // simply stays unmaterialized.
+    // Layer 1: drop the projected-row memoizations so the InternalRow arrays become
+    // collectable. Touching `projectedRowsCache` materializes the lazy val if it had never
+    // been used, but that is just an empty ConcurrentHashMap allocation.
     projectedRowsCache.clear()
+    // Layer 2: close any GPU-resident projection batches we own. Use safeClose so a single
+    // failing close does not skip the rest. Iteration on ConcurrentHashMap is safe under
+    // concurrent modification, but `closeInternal` is invoked from finalize/GC after all
+    // executors have stopped using this broadcast, so concurrent access here is not
+    // expected in practice.
+    val gpuValues = new java.util.ArrayList[SpillableColumnarBatch](projectedGpuBatchCache.values())
+    projectedGpuBatchCache.clear()
+    import scala.collection.JavaConverters._
+    gpuValues.asScala.toSeq.safeClose()
   }
 
   @scala.annotation.nowarn("msg=method finalize in class Object is deprecated")
