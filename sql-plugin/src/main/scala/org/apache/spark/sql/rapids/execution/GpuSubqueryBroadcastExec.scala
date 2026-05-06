@@ -214,7 +214,21 @@ case class GpuSubqueryBroadcastExec(
       SQLExecution.withExecutionId(session, executionId) {
         val broadcastBatch = child.executeBroadcast[Any]()
         val result: Array[InternalRow] = broadcastBatch.value match {
-          case b: SerializeConcatHostBuffersDeserializeBatch =>  projectSerializedBatchToRows(b)
+          case b: SerializeConcatHostBuffersDeserializeBatch =>
+            // Layer 1 (BENCHMARK.md "GpuSubqueryBroadcast re-execution"): memoize the
+            // projected rows on the broadcast value itself. The cache key is the canonical
+            // projection spec (indices + buildKeys + modeKeys), which matches Spark's
+            // ReusedSubquery canonicalization. Sibling fact-table sub-trees referencing the
+            // same DPP date_dim subquery now resolve to a ConcurrentHashMap get instead of
+            // re-running serBatch.hostBatch -> rowIterator -> UnsafeProjection per probe.
+            val key = ProjectedRowsKey(
+              "subquery",
+              indices,
+              buildKeys.map(_.canonicalized),
+              modeKeys.map(_.map(_.canonicalized)))
+            b.projectedRowsOrCompute(key) {
+              projectSerializedBatchToRows(b)
+            }
           case b if SparkShimImpl.isEmptyRelation(b) => Array.empty
           case b => throw new IllegalStateException(s"Unexpected broadcast type: ${b.getClass}")
         }
