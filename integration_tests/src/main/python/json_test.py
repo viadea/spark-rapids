@@ -763,6 +763,20 @@ def test_from_json_struct(schema):
             .select(f.col('a'), f.from_json('a', schema)),
         conf=_enable_all_types_conf)
 
+@allow_non_gpu(*non_utc_allow)
+def test_from_json_struct_open_brace_recovery_issue_14813():
+    schema = 'struct<a:string>'
+    data = [("{",), ("{",)]
+    assert_gpu_and_cpu_are_equal_collect(
+        lambda spark : spark.createDataFrame(
+            spark.sparkContext.parallelize(data, 1), 'json STRING') \
+            .select(f.from_json(f.col('json'), schema).alias('parsed')),
+        conf=copy_and_update(_enable_all_types_conf, {
+            'spark.rapids.sql.batchSizeBytes': '256m',
+            'spark.rapids.sql.concurrentGpuTasks': '2',
+            'spark.sql.shuffle.partitions': '1'
+        }))
+
 @pytest.mark.parametrize('schema', [
     'struct<a:string,a:string>',
     ])
